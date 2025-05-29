@@ -15,6 +15,7 @@ import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools_rust import RustExtension
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
@@ -695,4 +696,10 @@ setup(
     },
     cmdclass=cmdclass,
     package_data=package_data,
+    rust_extensions=[
+        RustExtension(
+            "vllm.transformers_utils.tokenizers.native_tokenizer_ext",
+            "vllm/transformers_utils/tokenizers/native_tokenizer_ext/Cargo.toml"
+        )
+    ],  # noqa: E501
 )

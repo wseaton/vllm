@@ -6,6 +6,7 @@ requires = [
     "packaging>=24.2",
     "setuptools>=77.0.3,<80.0.0",
     "setuptools-scm>=8.0",
+    "setuptools_rust",
     "torch == 2.7.0",
     "wheel",
     "regex",
@@ -178,3 +179,10 @@ respect-ignore-files = true
 
 [tool.ty.environment]
 python = "./.venv"
+
+
+[tool.uv]
+# Triton cannot be installed on macs.
+override-dependencies = [
+    "triton>=3.0,<3.2; sys_platform != 'darwin'",
+]
