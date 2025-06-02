@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import time
+from dataclasses import dataclass, field
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
@@ -14,6 +17,74 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
+
+
+class ErrorType(str, enum.Enum):
+    """Categorizes request abort/failure reasons for programmatic handling"""
+
+    KV_TRANSFER_FAILURE = "kv_transfer_failure"
+
+
+@dataclass
+class RequestErrorContext:
+    """Rich error context for request failures.
+
+    This class encapsulates all relevant information about why a request
+    failed, enabling better error handling and more informative responses
+    to clients.
+    """
+
+    # error category for programmatic handling
+    error_type: Union[ErrorType, str]
+
+    # Human-readable error message
+    message: str
+
+    # HTTP status code to return (if applicable)
+    # Examples: HTTPStatus.BAD_GATEWAY for KV transfer failures,
+    #           HTTPStatus.INTERNAL_SERVER_ERROR for internal errors
+    http_status: Optional[HTTPStatus] = None
+
+    # Additional structured metadata
+    metadata: Optional[dict[str, Any]] = None
+
+    # Timestamp when error occurred
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict for serialization across processes."""
+        return {
+            "error_type":
+            self.error_type.value
+            if isinstance(self.error_type, ErrorType) else self.error_type,
+            "message":
+            self.message,
+            "http_status_code":
+            self.http_status.value if self.http_status else None,
+            "metadata":
+            self.metadata,
+            "timestamp":
+            self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RequestErrorContext":
+        """Reconstruct from dict after deserialization."""
+        http_status_code = data.get("http_status_code")
+        error_type_str = data["error_type"]
+        # try to convert to ErrorType enum, fallback to string
+        try:
+            error_type = ErrorType(error_type_str)
+        except ValueError:
+            error_type = error_type_str
+        return cls(
+            error_type=error_type,
+            message=data["message"],
+            http_status=HTTPStatus(http_status_code)
+            if http_status_code else None,
+            metadata=data.get("metadata"),
+            timestamp=data.get("timestamp", time.time()),
+        )
 
 
 class Request:
@@ -45,6 +116,7 @@ class Request:
                        RequestStatus.WAITING)
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: Union[int, str, None] = None
+        self.error_context: Optional[RequestErrorContext] = None
         assert sampling_params.max_tokens is not None
         self.max_tokens = sampling_params.max_tokens
 
@@ -155,6 +227,14 @@ class Request:
             return None
         events, self.events = self.events, []
         return events
+
+    def abort_with_error_context(
+        self,
+        error_context: RequestErrorContext,
+    ) -> None:
+        """Abort request with rich error context for better error handling."""
+        self.status = RequestStatus.FINISHED_ABORTED
+        self.error_context = error_context
 
 
 class RequestStatus(enum.IntEnum):
