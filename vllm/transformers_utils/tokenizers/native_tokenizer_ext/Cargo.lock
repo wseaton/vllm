@@ -376,6 +376,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
 name = "libc"
 version = "0.2.172"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -465,10 +471,11 @@ dependencies = [
  "ndarray",
  "numpy",
  "pyo3",
+ "pyo3-build-config",
  "rayon",
  "serde",
  "serde_json",
- "tokenizers",
+ "tokenizers 0.21.1",
  "tokenizers-python",
 ]
 
@@ -906,7 +913,40 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3169b3195f925496c895caee7978a335d49218488ef22375267fba5a46a40bd7"
+dependencies = [
+ "aho-corasick",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom",
+ "indicatif",
+ "itertools 0.13.0",
+ "lazy_static",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "onig",
+ "paste",
+ "rand",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
+name = "tokenizers"
 version = "0.21.2-dev.0"
+source = "git+https://github.com/wseaton/tokenizers.git?branch=vllm-modifications#64f436819ac1f8cf042a6e66f90b4131d154f48b"
 dependencies = [
  "aho-corasick",
  "derive_builder",
@@ -936,6 +976,7 @@ dependencies = [
 [[package]]
 name = "tokenizers-python"
 version = "0.21.2-dev.0"
+source = "git+https://github.com/wseaton/tokenizers.git?branch=vllm-modifications#64f436819ac1f8cf042a6e66f90b4131d154f48b"
 dependencies = [
  "env_logger",
  "itertools 0.12.1",
@@ -946,7 +987,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "tokenizers",
+ "tokenizers 0.21.2-dev.0",
 ]
 
 [[package]]
