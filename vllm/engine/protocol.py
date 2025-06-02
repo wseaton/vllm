@@ -2,11 +2,13 @@
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, Mapping, Optional
+from typing import AsyncGenerator, Mapping, Optional, Union
 
 from vllm.beam_search import BeamSearchSequence, create_sort_beams_key_function
 from vllm.config import DecodingConfig, ModelConfig, VllmConfig
 from vllm.core.scheduler import SchedulerOutputs
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata)
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -259,6 +261,13 @@ class EngineClient(ABC):
 
     @abstractmethod
     async def is_tracing_enabled(self) -> bool:
+        ...
+
+    @abstractmethod
+    async def get_kv_connector_metadata(
+        self,
+    ) -> Optional[Union[KVConnectorMetadata, tuple[KVConnectorMetadata]]]:
+        """Get the KV connector metadata tied to the scheduler."""
         ...
 
     @abstractmethod

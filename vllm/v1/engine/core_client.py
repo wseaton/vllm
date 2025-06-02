@@ -126,6 +126,9 @@ class EngineCoreClient(ABC):
     def pin_lora(self, lora_id: int) -> bool:
         raise NotImplementedError
 
+    def get_kv_connector_config(self) -> Optional[dict[str, Any]]:
+        raise NotImplementedError
+
     def save_sharded_state(self,
                            path: str,
                            pattern: Optional[str] = None,
@@ -252,6 +255,10 @@ class InprocClient(EngineCoreClient):
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.engine_core.pin_lora(lora_id)
+
+    def get_kv_connector_metadata(self) -> Optional[dict[str, Any]]:
+        """Get the KV connector metadata from the scheduler if it exists."""
+        return self.engine_core.get_kv_connector_metadata()
 
     def save_sharded_state(self,
                            path: str,

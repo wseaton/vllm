@@ -13,6 +13,8 @@ from vllm.distributed.kv_transfer.kv_connector.factory import (
     KVConnectorFactory)
 from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
                                                           KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
@@ -860,6 +862,12 @@ class Scheduler(SchedulerInterface):
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
+
+    def get_kv_connector_metadata(self) -> Optional[KVConnectorMetadata]:
+        """Returns the KV connector metadata if available."""
+        if self.connector is None:
+            return None
+        return self.connector._get_connector_metadata()  # pylint: disable=protected-access
 
     def add_request(self, request: Request) -> None:
         self.waiting.append(request)

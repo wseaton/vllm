@@ -17,6 +17,8 @@ import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1, KVConnectorMetadata)
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -326,6 +328,14 @@ class EngineCore:
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_executor.pin_lora(lora_id)
+
+    def get_kv_connector_metadata(self) -> Optional[KVConnectorMetadata]:
+        """Get the metadata of the KVConnector used by the scheduler."""
+        kv_connector: Optional[
+            KVConnectorBase_V1] = self.scheduler.get_kv_connector()
+        if kv_connector is None:
+            return None
+        return kv_connector.get_connector_metadata()
 
     def save_sharded_state(
         self,
