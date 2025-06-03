@@ -542,50 +542,116 @@ class NixlConnectorWorker:
         self._nixl_handshake_listener_t.start()
         ready_event.wait()
 
-    def add_remote_agent(self, nixl_agent_meta: NixlAgentMetadata):
-        engine_id = nixl_agent_meta.engine_id
-        assert engine_id != self.engine_id, "Conflict engine id found!"
-        if engine_id in self._remote_agents:
-            return
 
-        self._remote_agents[engine_id] = self.nixl_wrapper.add_remote_agent(
-            nixl_agent_meta.agent_metadata)
-        self.kv_caches_base_addr[
-            engine_id] = nixl_agent_meta.kv_caches_base_addr
+def add_remote_agent(self, nixl_agent_meta: NixlAgentMetadata):
+    start_time = time.perf_counter()
+    engine_id = nixl_agent_meta.engine_id
 
-        # Create src descs and xfer side handles.
-        blocks_data = []
-        for base_addr in self.kv_caches_base_addr[self.engine_id]:
-            for block_id in range(self.num_blocks):
-                block_offset = block_id * self.block_len
-                # (addr, len, device id)
-                blocks_data.append(
-                    (base_addr + block_offset, self.block_len, self.tp_rank))
-        logger.debug("Created %s blocks for src engine %s and tp_rank %s",
-                     len(blocks_data), self.engine_id, self.tp_rank)
+    logger.debug(
+        "Starting add_remote_agent for engine_id=%s (self.engine_id=%s)",
+        engine_id, self.engine_id)
 
-        # Register with NIXL.
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
-        self.src_xfer_side_handle = self.nixl_wrapper.prep_xfer_dlist(
-            "NIXL_INIT_AGENT", descs)
+    assert engine_id != self.engine_id, "Conflict engine id found!"
+    if engine_id in self._remote_agents:
+        logger.debug("Remote agent %s already exists, returning early",
+                     engine_id)
+        return
 
-        # Create dst descs and xfer side handles.
-        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-        blocks_data = []
-        for base_addr in self.kv_caches_base_addr[engine_id]:
-            for block_id in range(nixl_agent_meta.num_blocks):
-                block_offset = block_id * self.block_len
-                # (addr, len, device id)
-                blocks_data.append(
-                    (base_addr + block_offset, self.block_len, self.tp_rank))
-        logger.debug("Created %s blocks for dst engine %s and tp_rank %s",
-                     len(blocks_data), engine_id, self.tp_rank)
+    # Add remote agent via nixl_wrapper
+    agent_add_start = time.perf_counter()
+    self._remote_agents[engine_id] = self.nixl_wrapper.add_remote_agent(
+        nixl_agent_meta.agent_metadata)
+    agent_add_duration = time.perf_counter() - agent_add_start
 
-        # Register with NIXL.
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
-        self.dst_xfer_side_handles[
-            engine_id] = self.nixl_wrapper.prep_xfer_dlist(
-                self._remote_agents[engine_id], descs)
+    self.kv_caches_base_addr[engine_id] = nixl_agent_meta.kv_caches_base_addr
+
+    logger.debug("Added remote agent %s in %.4f ms, total remote agents: %d",
+                 engine_id, agent_add_duration * 1000,
+                 len(self._remote_agents))
+    logger.debug("KV cache base addresses for engine %s: %s", engine_id,
+                 nixl_agent_meta.kv_caches_base_addr)
+
+    # Create src descs and xfer side handles.
+    src_blocks_start = time.perf_counter()
+    blocks_data = []
+    src_base_addrs = self.kv_caches_base_addr[self.engine_id]
+
+    logger.debug(
+        "Creating src blocks data: %d base addresses, %d blocks per address, " \
+        "block_len=%d",
+        len(src_base_addrs), self.num_blocks, self.block_len)
+
+    for base_addr in src_base_addrs:
+        for block_id in range(self.num_blocks):
+            block_offset = block_id * self.block_len
+            # (addr, len, device id)
+            blocks_data.append(
+                (base_addr + block_offset, self.block_len, self.tp_rank))
+
+    src_blocks_duration = time.perf_counter() - src_blocks_start
+    logger.debug("Created %d src blocks for engine %s (tp_rank=%s) in %.4f ms",
+                 len(blocks_data), self.engine_id, self.tp_rank,
+                 src_blocks_duration * 1000)
+
+    # Register with NIXL for src
+    src_nixl_start = time.perf_counter()
+    descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
+    src_desc_duration = time.perf_counter() - src_nixl_start
+
+    prep_start = time.perf_counter()
+    self.src_xfer_side_handle = self.nixl_wrapper.prep_xfer_dlist(
+        "NIXL_INIT_AGENT", descs)
+    prep_duration = time.perf_counter() - prep_start
+
+    logger.debug(
+        "NIXL src operations: get_xfer_descs=%.4f ms, prep_xfer_dlist=%.4f ms",
+        src_desc_duration * 1000, prep_duration * 1000)
+
+    # Create dst descs and xfer side handles.
+    dst_blocks_start = time.perf_counter()
+    self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+    blocks_data = []
+    dst_base_addrs = self.kv_caches_base_addr[engine_id]
+
+    logger.debug(
+        "Creating dst blocks data: %d base addresses, %d blocks per " \
+        "address for engine %s",
+        len(dst_base_addrs), nixl_agent_meta.num_blocks, engine_id)
+
+    for base_addr in dst_base_addrs:
+        for block_id in range(nixl_agent_meta.num_blocks):
+            block_offset = block_id * self.block_len
+            # (addr, len, device id)
+            blocks_data.append(
+                (base_addr + block_offset, self.block_len, self.tp_rank))
+
+    dst_blocks_duration = time.perf_counter() - dst_blocks_start
+    logger.debug("Created %d dst blocks for engine %s (tp_rank=%s) in %.4f ms",
+                 len(blocks_data), engine_id, self.tp_rank,
+                 dst_blocks_duration * 1000)
+
+    # Register with NIXL for dst
+    dst_nixl_start = time.perf_counter()
+    descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
+    dst_desc_duration = time.perf_counter() - dst_nixl_start
+
+    dst_prep_start = time.perf_counter()
+    self.dst_xfer_side_handles[engine_id] = self.nixl_wrapper.prep_xfer_dlist(
+        self._remote_agents[engine_id], descs)
+    dst_prep_duration = time.perf_counter() - dst_prep_start
+
+    logger.debug(
+        "NIXL dst operations: get_xfer_descs=%.4f ms, prep_xfer_dlist=%.4f ms",
+        dst_desc_duration * 1000, dst_prep_duration * 1000)
+
+    total_duration = time.perf_counter() - start_time
+    logger.debug(
+        "Successfully added remote agent %s: total_time=%.4f ms, "
+        "src_blocks=%d, dst_blocks=%d, total_remote_agents=%d", engine_id,
+        total_duration * 1000,
+        len(src_base_addrs) * self.num_blocks,
+        len(dst_base_addrs) * nixl_agent_meta.num_blocks,
+        len(self._remote_agents))
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
