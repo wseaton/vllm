@@ -1,27 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 import gc
 import os
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 import torch.distributed
 import torch.nn as nn
 
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
+                                          is_v1_kv_transfer_group,
+                                          get_kv_transfer_group)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils import GiB_bytes
+from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
@@ -129,7 +135,22 @@ class Worker(WorkerBase):
             _check_if_gpu_supports_dtype(self.model_config.dtype)
             gc.collect()
             torch.cuda.empty_cache()
-            self.init_gpu_memory = torch.cuda.mem_get_info()[0]
+
+            # take current memory snapshot
+            self.init_snapshot = MemorySnapshot()
+            self.requested_memory = (self.init_snapshot.total_memory *
+                                     self.cache_config.gpu_memory_utilization)
+            if self.init_snapshot.free_memory < self.requested_memory:
+                GiB = lambda b: round(b / GiB_bytes, 2)
+                raise ValueError(
+                    f"Free memory on device "
+                    f"({GiB(self.init_snapshot.free_memory)}/"
+                    f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
+                    f"is less than desired GPU memory utilization "
+                    f"({self.cache_config.gpu_memory_utilization}, "
+                    f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
+                    f"utilization or reduce GPU memory used by other processes."
+                )
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
@@ -178,40 +199,72 @@ class Worker(WorkerBase):
         """
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        GiB = lambda b: b / GiB_bytes
 
-        _, total_gpu_memory = torch.cuda.mem_get_info()
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        self.model_runner.profile_run()
+        with memory_profiling(
+                self.init_snapshot,
+                weights_memory=int(
+                    self.model_runner.model_memory_usage)) as profile_result:
+            self.model_runner.profile_run()
 
-        free_gpu_memory, _ = torch.cuda.mem_get_info()
+        free_gpu_memory = profile_result.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_gpu_memory > free_gpu_memory, (
+        assert self.init_snapshot.free_memory > free_gpu_memory, (
             "Error in memory profiling. "
-            f"Initial free memory {self.init_gpu_memory}, current free memory"
-            f" {free_gpu_memory}. This happens when the GPU memory was "
-            "not properly cleaned up before initializing the vLLM instance.")
+            f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
+            f"current free memory {GiB(free_gpu_memory)} GiB. "
+            "This happens when other processes sharing the same container "
+            "release GPU memory while vLLM is profiling during initialization. "
+            "To fix this, ensure consistent GPU memory allocation or "
+            "isolate vLLM in its own container.")
+        available_kv_cache_memory = self.requested_memory \
+            - profile_result.non_kv_cache_memory
 
-        # Get the peak memory allocation recorded by torch
-        peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-
-        # Check for any memory left around that may have been allocated on the
-        # gpu outside of `torch`. NCCL operations, for example, can use a few
-        # GB during a forward pass
-        torch.cuda.empty_cache()
-        torch_allocated_bytes = torch.cuda.memory_stats(
-        )["allocated_bytes.all.current"]
-        total_allocated_bytes = torch.cuda.mem_get_info(
-        )[1] - torch.cuda.mem_get_info()[0]
-        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
-        if non_torch_allocations > 0:
-            peak_memory += non_torch_allocations
-        available_kv_cache_memory = (
-            total_gpu_memory * self.cache_config.gpu_memory_utilization -
-            peak_memory)
+        logger.debug(
+            "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
+            "requested GPU memory: %.2f GiB",
+            GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
+            GiB(self.requested_memory))
+        logger.debug(profile_result)
+        logger.info("Available KV cache memory: %.2f GiB",
+                    GiB(available_kv_cache_memory))
+        gc.collect()
 
         return int(available_kv_cache_memory)
+
+    def get_kv_connector_handshake_metadata(self) -> Optional[dict]:
+        """Get KV connector metadata from this worker if available."""
+
+        connector = get_kv_transfer_group()
+        if not is_v1_kv_transfer_group(connector):
+            logger.warning(
+                "The KV connector is not a v1 connector. "
+                "This method is only supported for v1 connectors.")
+            return None
+        
+        # Only return metadata if this is a worker role
+        if connector.role == KVConnectorRole.WORKER:
+            metadata = connector.get_handshake_metadata()
+            if metadata is None:
+                logger.warning(
+                    "KV connector metadata is not available. "
+                    "This may happen if the KV connector is not initialized "
+                    "or the worker is not part of a disaggregated KV cache setup."
+                )
+                return None
+            
+            tp_rank = get_tp_group().rank_in_group
+            dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+            return {
+                tp_rank: {
+                    dp_rank: msgspec.to_builtins(metadata)
+                }
+            }
+        
+        return None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
@@ -341,13 +394,14 @@ def init_worker_distributed_environment(
     rank: int,
     distributed_init_method: Optional[str] = None,
     local_rank: int = -1,
+    backend: str = "nccl",
 ) -> None:
     """Initialize the distributed environment."""
     parallel_config = vllm_config.parallel_config
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
     init_distributed_environment(parallel_config.world_size, rank,
-                                 distributed_init_method, local_rank)
+                                 distributed_init_method, local_rank, backend)
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
 import atexit
@@ -101,8 +102,6 @@ from vllm.utils import (Device, FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
 from vllm.v1.metrics.prometheus import get_prometheus_registry
 from vllm.version import __version__ as VLLM_VERSION
-
-TIMEOUT_KEEP_ALIVE = 5  # seconds
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
@@ -869,6 +868,11 @@ if envs.VLLM_SERVER_DEV_MODE:
         server_info = {"vllm_config": str(raw_request.app.state.vllm_config)}
         return JSONResponse(content=server_info)
 
+    @router.get("/get_kv_connector_metadata")
+    async def get_kv_connector_metadata(raw_request: Request):
+        kv_connector_metadata = raw_request.app.state.vllm_config.cache_config.transfer_handshake_metadata
+        return JSONResponse(content=kv_connector_metadata)
+
     @router.post("/reset_prefix_cache")
     async def reset_prefix_cache(raw_request: Request):
         """
@@ -1359,7 +1363,7 @@ async def run_server_worker(listen_address,
             # NOTE: When the 'disable_uvicorn_access_log' value is True,
             # no access log will be output.
             access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
             ssl_keyfile=args.ssl_keyfile,
             ssl_certfile=args.ssl_certfile,
             ssl_ca_certs=args.ssl_ca_certs,
