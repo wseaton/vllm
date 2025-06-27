@@ -93,6 +93,8 @@ from vllm.entrypoints.openai.serving_tokenization import (
 from vllm.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription, OpenAIServingTranslation)
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+from vllm.entrypoints.nixl_side_channel_server import (
+    start_nixl_side_channel_server_if_needed)
 from vllm.entrypoints.utils import (cli_env_setup, load_aware_call,
                                     with_cancellation)
 from vllm.logger import init_logger
@@ -916,6 +918,7 @@ if envs.VLLM_SERVER_DEV_MODE:
         server_info = {"vllm_config": str(raw_request.app.state.vllm_config)}
         return JSONResponse(content=server_info)
 
+
     @router.post("/reset_prefix_cache")
     async def reset_prefix_cache(raw_request: Request):
         """
@@ -1447,6 +1450,12 @@ async def run_server_worker(listen_address,
         vllm_config = await engine_client.get_vllm_config()
         await init_app_state(engine_client, vllm_config, app.state, args)
 
+        nixl_side_channel_server = None
+        try:
+            nixl_side_channel_server = await start_nixl_side_channel_server_if_needed(vllm_config)
+        except Exception as e:
+            logger.warning("Failed to start NIXL side channel server: %s", e)
+
         logger.info("Starting vLLM API server %d on %s", server_index,
                     listen_address)
         shutdown_task = await serve_http(
@@ -1471,6 +1480,11 @@ async def run_server_worker(listen_address,
     try:
         await shutdown_task
     finally:
+        if nixl_side_channel_server is not None:
+            try:
+                await nixl_side_channel_server.stop_async()
+            except Exception as e:
+                logger.warning("Error stopping NIXL side channel server: %s", e)
         sock.close()
 
 
