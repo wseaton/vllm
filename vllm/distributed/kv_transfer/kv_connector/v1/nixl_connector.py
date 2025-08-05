@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -48,6 +49,18 @@ if TYPE_CHECKING:
 Transfer = tuple[int, float]  # (xfer_handle, start_time)
 EngineId = str
 ReqId = str
+
+
+def _is_ssl_enabled() -> bool:
+    """
+    Detect if SSL is enabled by checking for SSL arguments in command line.
+    This matches the logic in SSLConfig.is_ssl_enabled which requires both
+    ssl_keyfile and ssl_certfile to be present.
+    """
+    has_keyfile = any('--ssl-keyfile' in arg for arg in sys.argv)
+    has_certfile = any('--ssl-certfile' in arg for arg in sys.argv)
+    return has_keyfile and has_certfile
+
 
 GET_META_MSG = b"get_meta_msg"
 
@@ -234,25 +247,44 @@ class HttpHandshakeStrategy(HandshakeStrategy):
     North-South, not P2P.
     """
 
-    def __init__(self, nixl_wrapper, tp_rank: int, tp_size: int,
-                 side_channel_port: int, engine_id: str,
-                 add_remote_agent_func):
+    def __init__(self,
+                 nixl_wrapper,
+                 tp_rank: int,
+                 tp_size: int,
+                 side_channel_port: int,
+                 engine_id: str,
+                 add_remote_agent_func,
+                 ssl_enabled: bool = False):
         super().__init__(nixl_wrapper, tp_rank, tp_size, side_channel_port,
                          engine_id)
         self.add_remote_agent_func = add_remote_agent_func
         self._tp_size_mapping: dict[str, int] = {engine_id: tp_size}
+        self.ssl_enabled = ssl_enabled
 
     def initiate_handshake(self, host: str, port: int, remote_tp_size: int,
                            expected_engine_id: str) -> dict[int, str]:
         start_time = time.perf_counter()
         logger.debug("Starting NIXL handshake with %s:%s", host, port)
 
-        url = build_uri("http", host, port, path="get_kv_connector_metadata")
+        protocol = "https" if self.ssl_enabled else "http"
+        url = build_uri(protocol, host, port, path="get_kv_connector_metadata")
 
         try:
             req = URLRequest(url)
+
+            # Configure SSL context for HTTPS requests
+            ssl_context = None
+            if self.ssl_enabled:
+                import ssl
+                ssl_context = ssl.create_default_context()
+                # For self-signed certificates, we might need to disable verify
+                # This can be made configurable later if needed
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+
             with urlopen(req,
-                         timeout=envs.VLLM_NIXL_HANDSHAKE_TIMEOUT) as response:
+                         timeout=envs.VLLM_NIXL_HANDSHAKE_TIMEOUT,
+                         context=ssl_context) as response:
                 response_data = response.read().decode('utf-8')
                 res = json.loads(response_data)
         except (URLError, HTTPError) as e:
@@ -816,8 +848,13 @@ class NixlConnectorWorker:
                 self.side_channel_port, self.engine_id, self.add_remote_agent)
         elif handshake_method == "http":
             self._handshake_strategy = HttpHandshakeStrategy(
-                self.nixl_wrapper, self.tp_rank, self.world_size,
-                self.side_channel_port, self.engine_id, self.add_remote_agent)
+                self.nixl_wrapper,
+                self.tp_rank,
+                self.world_size,
+                self.side_channel_port,
+                self.engine_id,
+                self.add_remote_agent,
+                ssl_enabled=_is_ssl_enabled())
         else:
             raise ValueError(f"Unknown handshake method: {handshake_method}. "
                              "Supported methods: 'zmq', 'http'")
