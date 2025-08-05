@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import base64
 import contextlib
-import json
 import logging
 import math
 import queue
-import sys
 import threading
 import time
 import uuid
@@ -16,9 +14,6 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.error import HTTPError, URLError
-from urllib.request import Request as URLRequest
-from urllib.request import urlopen
 
 import msgspec
 import torch
@@ -27,6 +22,7 @@ import zmq
 from vllm import envs
 from vllm.attention.selector import backend_name_to_enum, get_attn_backend
 from vllm.config import VllmConfig
+from vllm.connections import HTTPConnection
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp, KVConnectorBase_V1, KVConnectorHandshakeMetadata,
     KVConnectorMetadata, KVConnectorRole)
@@ -49,18 +45,6 @@ if TYPE_CHECKING:
 Transfer = tuple[int, float]  # (xfer_handle, start_time)
 EngineId = str
 ReqId = str
-
-
-def _is_ssl_enabled() -> bool:
-    """
-    Detect if SSL is enabled by checking for SSL arguments in command line.
-    This matches the logic in SSLConfig.is_ssl_enabled which requires both
-    ssl_keyfile and ssl_certfile to be present.
-    """
-    has_keyfile = any('--ssl-keyfile' in arg for arg in sys.argv)
-    has_certfile = any('--ssl-certfile' in arg for arg in sys.argv)
-    return has_keyfile and has_certfile
-
 
 GET_META_MSG = b"get_meta_msg"
 
@@ -254,40 +238,29 @@ class HttpHandshakeStrategy(HandshakeStrategy):
                  side_channel_port: int,
                  engine_id: str,
                  add_remote_agent_func,
-                 ssl_enabled: bool = False):
+                 ssl_config=None):
         super().__init__(nixl_wrapper, tp_rank, tp_size, side_channel_port,
                          engine_id)
         self.add_remote_agent_func = add_remote_agent_func
         self._tp_size_mapping: dict[str, int] = {engine_id: tp_size}
-        self.ssl_enabled = ssl_enabled
+        self.ssl_config = ssl_config
 
     def initiate_handshake(self, host: str, port: int, remote_tp_size: int,
                            expected_engine_id: str) -> dict[int, str]:
         start_time = time.perf_counter()
         logger.debug("Starting NIXL handshake with %s:%s", host, port)
 
-        protocol = "https" if self.ssl_enabled else "http"
+        protocol = "https" if (self.ssl_config
+                               and self.ssl_config.is_ssl_enabled) else "http"
         url = build_uri(protocol, host, port, path="get_kv_connector_metadata")
 
         try:
-            req = URLRequest(url)
-
-            # Configure SSL context for HTTPS requests
-            ssl_context = None
-            if self.ssl_enabled:
-                import ssl
-                ssl_context = ssl.create_default_context()
-                # For self-signed certificates, we might need to disable verify
-                # This can be made configurable later if needed
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-
-            with urlopen(req,
-                         timeout=envs.VLLM_NIXL_HANDSHAKE_TIMEOUT,
-                         context=ssl_context) as response:
-                response_data = response.read().decode('utf-8')
-                res = json.loads(response_data)
-        except (URLError, HTTPError) as e:
+            http_client = HTTPConnection(ssl_config=self.ssl_config)
+            response = http_client.get_response(
+                url, timeout=envs.VLLM_NIXL_HANDSHAKE_TIMEOUT)
+            response.raise_for_status()
+            res = response.json()
+        except Exception as e:
             logger.error("Failed to fetch metadata from %s: %s", url, e)
             raise
 
@@ -854,7 +827,7 @@ class NixlConnectorWorker:
                 self.side_channel_port,
                 self.engine_id,
                 self.add_remote_agent,
-                ssl_enabled=_is_ssl_enabled())
+                ssl_config=self.vllm_config.ssl_config)
         else:
             raise ValueError(f"Unknown handshake method: {handshake_method}. "
                              "Supported methods: 'zmq', 'http'")

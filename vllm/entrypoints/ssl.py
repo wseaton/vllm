@@ -5,7 +5,10 @@ import asyncio
 import os
 from dataclasses import dataclass
 from ssl import SSLContext
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    import ssl
 
 import uvicorn
 from watchfiles import Change, awatch
@@ -92,6 +95,29 @@ class SSLConfig:
             ssl_cert_reqs=getattr(args, 'ssl_cert_reqs', None),
             enable_ssl_refresh=getattr(args, 'enable_ssl_refresh', False),
         )
+
+    def create_ssl_context(self) -> 'ssl.SSLContext':
+        """Create SSL context for client connections."""
+        if not self.is_ssl_enabled:
+            raise ValueError("SSL is not enabled")
+
+        import ssl
+        context = ssl.create_default_context()
+
+        # Load CA certificates if provided
+        if self.ssl_ca_certs:
+            context.load_verify_locations(cafile=self.ssl_ca_certs)
+            # Keep default verification settings when CA is provided
+        else:
+            # For self-signed certificates without CA, disable verification
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+        # Apply certificate requirements if specified
+        if self.ssl_cert_reqs is not None:
+            context.verify_mode = self.ssl_cert_reqs
+
+        return context
 
     def get_protocol(self) -> str:
         """Get protocol string (http or https)."""
