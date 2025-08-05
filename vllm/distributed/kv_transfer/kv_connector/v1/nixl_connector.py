@@ -434,9 +434,9 @@ class NixlConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
-        # Set handshake metadata using the base class method
+        # Set handshake metadata directly
         if hasattr(self.connector_worker, 'xfer_metadata'):
-            self.set_handshake_metadata(self.connector_worker.xfer_metadata)
+            self._handshake_metadata = self.connector_worker.xfer_metadata
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         assert self.connector_worker is not None
@@ -470,11 +470,9 @@ class NixlConnector(KVConnectorBase_V1):
            self.connector_worker.copy_blocks:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
 
-    def set_handshake_metadata(self, handshake_metadata):
-        logger.debug("Setting handshake metadata for NIXL connector: %s",
-                     handshake_metadata)
-        assert self.connector_worker is not None
-        self._handshake_metadata = handshake_metadata
+    def get_handshake_metadata(self):
+        """Get the handshake metadata for NIXL connector."""
+        return self._handshake_metadata
 
 
 class NixlConnectorScheduler:
