@@ -83,7 +83,7 @@ class EngineCore:
 
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config, \
-            transfer_handshake_metadata = self._initialize_kv_caches(
+            xfer_handshake_metadata = self._initialize_kv_caches(
                 vllm_config)
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -92,7 +92,7 @@ class EngineCore:
                             args=(num_gpu_blocks, num_cpu_blocks))
 
         # Store KV connector metadata for handshake
-        self.transfer_handshake_metadata = transfer_handshake_metadata
+        self.xfer_handshake_metadata = xfer_handshake_metadata
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -202,14 +202,14 @@ class EngineCore:
 
         # Collect KV connector xfer metadata from workers
         # (after KV cache registration)
-        transfer_handshake_metadata = (
+        xfer_handshake_metadata = (
             self.model_executor.get_kv_connector_handshake_metadata())
 
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
         return (num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config,
-                transfer_handshake_metadata)
+                xfer_handshake_metadata)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
@@ -611,20 +611,20 @@ class EngineCoreProc(EngineCore):
             }
 
             # Include KV connector metadata if available
-            if hasattr(self, 'transfer_handshake_metadata'
-                       ) and self.transfer_handshake_metadata:
-                # self.transfer_handshake_metadata is list of dicts from workers
+            if hasattr(self, 'xfer_handshake_metadata'
+                       ) and self.xfer_handshake_metadata:
+                # self.xfer_handshake_metadata is list of dicts from workers
                 # Each dict already has structure {dp_rank: {tp_rank: metadata}}
                 # Merge all worker dicts into a single dict
                 content: dict[str, dict[str, dict[str, Any]]] = {}
-                for worker_dict in self.transfer_handshake_metadata:
+                for worker_dict in self.xfer_handshake_metadata:
                     if worker_dict is not None:
                         # Deep merge nested dictionaries instead of overwrite
                         for dp_rank, tp_dict in worker_dict.items():
                             if dp_rank not in content:
                                 content[dp_rank] = {}
                             content[dp_rank].update(tp_dict)
-                handshake_msg["transfer_handshake_metadata"] = content
+                handshake_msg["xfer_handshake_metadata"] = content
 
             handshake_socket.send(msgspec.msgpack.encode(handshake_msg))
 

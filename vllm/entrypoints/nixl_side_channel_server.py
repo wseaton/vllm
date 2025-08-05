@@ -39,7 +39,7 @@ class NixlSideChannelServer:
                                             tp_rank: Optional[int] = None):
             kv_meta: Optional[dict[int, dict[
                 int, KVConnectorHandshakeMetadata]]] = (
-                    self.vllm_config.cache_config.transfer_handshake_metadata)
+                    self.vllm_config.cache_config.xfer_handshake_metadata)
 
             if kv_meta is None:
                 return None

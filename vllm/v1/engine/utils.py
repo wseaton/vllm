@@ -806,16 +806,15 @@ def wait_for_engine_startup(
             cache_config.num_gpu_blocks = num_gpu_blocks
 
             # stash KV connector metadata in vllm_config if passed in.
-            if txfer_metadata := msg.get("transfer_handshake_metadata"):
+            if txfer_metadata := msg.get("xfer_handshake_metadata"):
                 logger.debug(
                     "Received transfer handshake metadata from engine %s: %s",
                     eng_index, txfer_metadata)
-                if cache_config.transfer_handshake_metadata is None:
-                    cache_config.transfer_handshake_metadata = defaultdict(
-                        dict)
+                if cache_config.xfer_handshake_metadata is None:
+                    cache_config.xfer_handshake_metadata = defaultdict(dict)
                 for dp_rank, tp_dict in txfer_metadata.items():
                     for tp_rank, metadata in tp_dict.items():
-                        cache_config.transfer_handshake_metadata[dp_rank][
+                        cache_config.xfer_handshake_metadata[dp_rank][
                             tp_rank] = metadata
             # In external DP LB mode, the coordinator address that the
             # front-end procs connect to is obtained from rank 0 via
