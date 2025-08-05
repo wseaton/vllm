@@ -242,8 +242,8 @@ class HttpHandshakeStrategy(HandshakeStrategy):
         self.add_remote_agent_func = add_remote_agent_func
         self._tp_size_mapping: dict[str, int] = {engine_id: tp_size}
 
-    def initiate_handshake(self, host: str, port: int,
-                           remote_tp_size: int) -> dict[int, str]:
+    def initiate_handshake(self, host: str, port: int, remote_tp_size: int,
+                           expected_engine_id: str) -> dict[int, str]:
         start_time = time.perf_counter()
         logger.debug("Starting NIXL handshake with %s:%s", host, port)
 
@@ -291,6 +291,11 @@ class HttpHandshakeStrategy(HandshakeStrategy):
         rank_data_copy.pop("agent_metadata", None)
         metadata = NixlAgentMetadata(
             agent_metadata=base64.b64decode(metadata_bytes), **rank_data_copy)
+
+        if metadata.engine_id != expected_engine_id:
+            raise RuntimeError(f"Remote NIXL agent engine ID mismatch. "
+                               f"Expected {expected_engine_id}, "
+                               f"received {metadata.engine_id}.")
 
         pre_register = time.perf_counter()
         # Register Remote agent
