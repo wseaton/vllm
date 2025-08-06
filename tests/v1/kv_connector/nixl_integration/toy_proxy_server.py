@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     app.state.decode_clients = []
 
     # Configure SSL verification
-    verify_ssl = True
+    verify_ssl: bool | str = True
     if global_args.enable_ssl:
         if global_args.ssl_insecure:
             verify_ssl = False
@@ -39,19 +39,19 @@ async def lifespan(app: FastAPI):
         protocol = 'https' if global_args.enable_ssl else 'http'
         prefiller_base_url = f'{protocol}://{host}:{port}/v1'
 
-        client_kwargs = {'timeout': None, 'base_url': prefiller_base_url}
         if global_args.enable_ssl:
-            client_kwargs['verify'] = verify_ssl
+            client = httpx.AsyncClient(timeout=None,
+                                       base_url=prefiller_base_url,
+                                       verify=verify_ssl)
+        else:
+            client = httpx.AsyncClient(timeout=None,
+                                       base_url=prefiller_base_url)
 
         app.state.prefill_clients.append({
-            'client':
-            httpx.AsyncClient(**client_kwargs),
-            'host':
-            host,
-            'port':
-            port,
-            'id':
-            i
+            'client': client,
+            'host': host,
+            'port': port,
+            'id': i
         })
 
     # Create decode clients
@@ -59,19 +59,18 @@ async def lifespan(app: FastAPI):
         protocol = 'https' if global_args.enable_ssl else 'http'
         decoder_base_url = f'{protocol}://{host}:{port}/v1'
 
-        client_kwargs = {'timeout': None, 'base_url': decoder_base_url}
         if global_args.enable_ssl:
-            client_kwargs['verify'] = verify_ssl
+            client = httpx.AsyncClient(timeout=None,
+                                       base_url=decoder_base_url,
+                                       verify=verify_ssl)
+        else:
+            client = httpx.AsyncClient(timeout=None, base_url=decoder_base_url)
 
         app.state.decode_clients.append({
-            'client':
-            httpx.AsyncClient(**client_kwargs),
-            'host':
-            host,
-            'port':
-            port,
-            'id':
-            i
+            'client': client,
+            'host': host,
+            'port': port,
+            'id': i
         })
 
     # Initialize round-robin iterators
