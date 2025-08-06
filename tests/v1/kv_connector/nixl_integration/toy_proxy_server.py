@@ -26,13 +26,12 @@ async def lifespan(app: FastAPI):
     app.state.decode_clients = []
 
     # Configure SSL verification
-    verify_ssl: bool | str = True
+    verify_ssl = True
     if global_args.enable_ssl:
         if global_args.ssl_insecure:
             verify_ssl = False
         elif global_args.ssl_ca_certs:
             verify_ssl = global_args.ssl_ca_certs
-        # else: verify_ssl = True (default SSL verification)
 
     # Create prefill clients
     for i, (host, port) in enumerate(global_args.prefiller_instances):
