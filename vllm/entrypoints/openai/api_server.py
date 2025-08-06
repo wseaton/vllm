@@ -1862,7 +1862,8 @@ async def run_server_worker(listen_address,
             nixl_side_channel_server = await \
                 set_up_nixl_side_channel_server(vllm_config, ssl_config)
         except Exception as e:
-            logger.warning("Failed to start NIXL side channel server: %s", e)
+            logger.error("Failed to start NIXL side channel server: %s", e)
+            raise
 
         logger.info("Starting vLLM API server %d on %s", server_index,
                     listen_address)
