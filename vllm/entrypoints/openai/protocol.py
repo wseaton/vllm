@@ -1592,7 +1592,7 @@ class FunctionCall(OpenAIBaseModel):
 
 class ToolCall(OpenAIBaseModel):
     id: str = Field(default_factory=random_tool_call_id)
-    type: Literal["function"] = "function"
+    type: Literal["function"] = Field(default="function", const=True)
     function: FunctionCall
 
 
