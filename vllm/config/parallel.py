@@ -182,7 +182,8 @@ class ParallelConfig:
 
     xfer_handshake_metadata: Optional[dict[int, dict[
         int, KVConnectorHandshakeMetadata]]] = None
-    """Metadata for KV transfer handshake between data parallel ranks."""
+    """ Metadata for KV transfer handshake between prefill and decode engine
+    processes."""
 
 >>>>>>> 049c877a2 (MR feedback:)
     @property
