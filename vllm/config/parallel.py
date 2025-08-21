@@ -174,18 +174,6 @@ class ParallelConfig:
     rank: int = 0
     """Global rank in distributed setup."""
 
-<<<<<<< HEAD
-=======
-    enable_multimodal_encoder_data_parallel: bool = False
-    """ Use data parallelism instead of tensor parallelism for vision encoder.
-    Only support LLama4 for now"""
-
-    xfer_handshake_metadata: Optional[dict[int, dict[
-        int, KVConnectorHandshakeMetadata]]] = None
-    """ Metadata for KV transfer handshake between prefill and decode engine
-    processes."""
-
->>>>>>> 049c877a2 (MR feedback:)
     @property
     def world_size_across_dp(self) -> int:
         """world_size_across_dp is TPxPPxDP, it is the size of the world
