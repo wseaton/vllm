@@ -27,8 +27,8 @@ if TYPE_CHECKING:
 else:
     RuntimeEnv = Any
     PlacementGroup = Any
-    ExecutorBase = Any
     KVConnectorHandshakeMetadata = Any
+    ExecutorBase = Any
 
 logger = init_logger(__name__)
 
