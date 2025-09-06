@@ -11,7 +11,8 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
 import numpy as np
@@ -51,10 +52,62 @@ logger = init_logger(__name__)
 # Lazy import nixl_wrapper to avoid loading nixl_bindings if nixl is not used
 try:
     from nixl._api import nixl_agent as NixlWrapper
+    from nixl_bindings import (nixlBackendError, nixlCancelledError,
+                               nixlInvalidParamError, nixlMismatchError,
+                               nixlNotAllowedError, nixlNoTelemetryError,
+                               nixlNotFoundError, nixlNotPostedError,
+                               nixlNotSupportedError,
+                               nixlRemoteDisconnectError,
+                               nixlRepostActiveError, nixlUnknownError)
     logger.info("NIXL is available")
 except ImportError:
     logger.warning("NIXL is not available")
     NixlWrapper = None
+
+    nixlCancelledError = None
+    nixlRemoteDisconnectError = None
+    nixlNotPostedError = None
+    nixlInvalidParamError = None
+    nixlBackendError = None
+    nixlNotFoundError = None
+    nixlMismatchError = None
+    nixlNotAllowedError = None
+    nixlRepostActiveError = None
+    nixlUnknownError = None
+    nixlNotSupportedError = None
+    nixlNoTelemetryError = None
+
+
+class NixlHandleStrategy(Enum):
+    """Strategy for handling NIXL exceptions."""
+    TRACK_HEALTH = "track_health"  # Track failure and assess remote health
+    SUPPRESS = "suppress"  # Suppress (retryable errors)
+    PROPAGATE = "propagate"  # Re-raise (client errors)
+
+
+# Mapping of NIXL exceptions to their handling strategy
+_NIXL_HANDLE_STRATEGY: dict[type, NixlHandleStrategy] = {}
+
+if NixlWrapper is not None and all(exc_type is not None for exc_type in [
+        nixlCancelledError, nixlRemoteDisconnectError, nixlNotPostedError,
+        nixlInvalidParamError, nixlBackendError, nixlNotFoundError,
+        nixlMismatchError, nixlNotAllowedError, nixlRepostActiveError,
+        nixlUnknownError, nixlNotSupportedError, nixlNoTelemetryError
+]):
+    _NIXL_HANDLE_STRATEGY = {
+        nixlCancelledError: NixlHandleStrategy.TRACK_HEALTH,
+        nixlRemoteDisconnectError: NixlHandleStrategy.TRACK_HEALTH,
+        nixlBackendError: NixlHandleStrategy.TRACK_HEALTH,
+        nixlUnknownError: NixlHandleStrategy.TRACK_HEALTH,
+        nixlNotPostedError: NixlHandleStrategy.SUPPRESS,
+        nixlRepostActiveError: NixlHandleStrategy.SUPPRESS,
+        nixlInvalidParamError: NixlHandleStrategy.PROPAGATE,
+        nixlNotFoundError: NixlHandleStrategy.PROPAGATE,
+        nixlMismatchError: NixlHandleStrategy.PROPAGATE,
+        nixlNotAllowedError: NixlHandleStrategy.PROPAGATE,
+        nixlNotSupportedError: NixlHandleStrategy.PROPAGATE,
+        nixlNoTelemetryError: NixlHandleStrategy.PROPAGATE,
+    }
 
 # Supported xPUs and types of kv transfer buffer.
 # {xPU: tuple of supported kv buffer types}
@@ -86,6 +139,145 @@ class ReqMeta:
     remote_port: int
     remote_engine_id: str
     tp_size: int
+
+
+@dataclass
+class RemoteHealthStats:
+    total_requests: int = 0
+    last_success_time: float = 0.0
+    consecutive_failures: int = 0
+
+
+class NixlRemoteHealthManager:
+    """Manages health tracking and deregistration of remote NIXL agents."""
+
+    def __init__(self, consecutive_failure_threshold: int,
+                 deregister_callback: Callable[[str, str], None]):
+        self.consecutive_failure_threshold = consecutive_failure_threshold
+        self.deregister_callback = deregister_callback
+        self._remote_health_stats: dict[str, RemoteHealthStats] = defaultdict(
+            RemoteHealthStats)
+        self._unhealthy_remotes: set[str] = set()
+        self._health_lock = threading.Lock()
+
+    def track_success(self, remote_agent_name: str):
+        """Track a successful operation for a remote agent."""
+        with self._health_lock:
+            stats = self._remote_health_stats[remote_agent_name]
+            stats.total_requests += 1
+            stats.last_success_time = time.perf_counter()
+            stats.consecutive_failures = 0
+            # mark healthy again
+            self._unhealthy_remotes.discard(remote_agent_name)
+
+    def track_failure(self, remote_agent_name: str):
+        """Track a failed operation for a remote agent."""
+        with self._health_lock:
+            stats = self._remote_health_stats[remote_agent_name]
+            stats.total_requests += 1
+            stats.consecutive_failures += 1
+
+    def is_unhealthy(self, remote_agent_name: str) -> bool:
+        """Check if a remote agent is marked as unhealthy."""
+        with self._health_lock:
+            return remote_agent_name in self._unhealthy_remotes
+
+    def assess_health(self, remote_agent_name: str,
+                      remote_engine_id: str) -> bool:
+        """
+        Assess if a remote agent should be marked as unhealthy.
+        
+        Returns:
+            True if the agent exceeded thresholds and was marked unhealthy
+        """
+        with self._health_lock:
+            if remote_agent_name in self._unhealthy_remotes:
+                return False
+
+            stats = self._remote_health_stats[remote_agent_name]
+
+            # Check health thresholds
+            if stats.consecutive_failures >= self.consecutive_failure_threshold:
+                logger.warning(
+                    "Remote agent %s exceeds consecutive failure threshold: "
+                    "%d >= %d", remote_agent_name, stats.consecutive_failures,
+                    self.consecutive_failure_threshold)
+                self._unhealthy_remotes.add(remote_agent_name)
+                self._remote_health_stats.pop(remote_agent_name, None)
+
+                try:
+                    self.deregister_callback(remote_agent_name,
+                                             remote_engine_id)
+                except Exception as e:
+                    logger.error("Deregister callback failed for agent %s: %s",
+                                 remote_agent_name, e)
+
+                return True
+
+        return False
+
+
+class NixlExceptionHandler:
+    """Handles NIXL exception categorization and response strategies."""
+
+    def __init__(self, health_manager: NixlRemoteHealthManager,
+                 agent_info_provider: Callable[[Optional[str], Optional[str]],
+                                               tuple[Optional[str],
+                                                     Optional[str]]]):
+        self.health_manager = health_manager
+        self.get_agent_info = agent_info_provider
+
+    def get_handle_strategy(self, exception: Exception) -> NixlHandleStrategy:
+        """Get the handling strategy for a NIXL exception."""
+        return _NIXL_HANDLE_STRATEGY.get(type(exception),
+                                         NixlHandleStrategy.PROPAGATE)
+
+    def is_nixl_exception(self, exception: Exception) -> bool:
+        """Check if an exception is a known NIXL exception."""
+        return type(exception) in _NIXL_HANDLE_STRATEGY
+
+    def handle_exception(self,
+                         exception: Exception,
+                         context: str,
+                         req_id: Optional[str] = None,
+                         remote_engine_id: Optional[str] = None) -> None:
+        """
+        Handle NIXL exceptions based on their strategy.
+        
+        Re-raises the exception if it should propagate to the caller,
+        otherwise handles it gracefully and returns normally.
+        """
+        strategy = self.get_handle_strategy(exception)
+        logger.warning("%s failed with NIXL error (%s): %s", context,
+                       strategy.value, str(exception))
+
+        if strategy == NixlHandleStrategy.PROPAGATE:
+            logger.error("Client error in %s, re-raising: %s", context,
+                         type(exception).__name__)
+            raise
+
+        elif strategy == NixlHandleStrategy.TRACK_HEALTH:
+            remote_agent_name, engine_id = self.get_agent_info(
+                req_id, remote_engine_id)
+            self.health_manager.track_failure(remote_agent_name)
+            self.health_manager.assess_health(remote_agent_name, engine_id)
+
+        # SUPPRESS strategy (and TRACK_HEALTH after tracking) are handled
+        # gracefully
+
+    def handle_cancelled_transfer(self,
+                                  context: str,
+                                  req_id: Optional[str] = None,
+                                  remote_engine_id: Optional[str] = None):
+        """Handle a cancelled transfer by tracking failure and
+        potentially marking remote as unhealthy."""
+        logger.warning("%s was cancelled, assessing remote health", context)
+
+        remote_agent_name, engine_id = self.get_agent_info(
+            req_id, remote_engine_id)
+
+        self.health_manager.track_failure(remote_agent_name)
+        self.health_manager.assess_health(remote_agent_name, engine_id)
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -436,6 +628,13 @@ class NixlConnectorWorker:
         self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), None)
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
         self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
+
+        # Initialize health and exception management
+        self.health_manager = NixlRemoteHealthManager(
+            envs.VLLM_NIXL_CONSECUTIVE_FAILURE_THRESHOLD,
+            self._deregister_unhealthy_remote)
+        self.exception_handler = NixlExceptionHandler(
+            self.health_manager, self._get_remote_agent_info)
 
         # NIXL handshake port.
         # NOTE(rob): Within a DP group, each DP rank gets its own
@@ -987,6 +1186,70 @@ class NixlConnectorWorker:
 
         return remote_agent_name
 
+    def _get_remote_agent_info(
+            self,
+            req_id: Optional[str] = None,
+            remote_engine_id: Optional[str] = None) -> tuple[str, str]:
+        """Extract remote agent name and engine ID from request metadata or
+        parameters."""
+        if remote_engine_id is None:
+            if req_id is None or req_id not in self._recving_metadata:
+                raise ValueError(
+                    f"Cannot determine remote engine ID: req_id={req_id} "
+                    f"not found in metadata")
+            meta = self._recving_metadata[req_id]
+            remote_engine_id = meta.remote_engine_id
+
+        if not remote_engine_id:
+            raise ValueError("Remote engine ID is None or empty")
+
+        if remote_engine_id not in self._remote_agents:
+            raise ValueError(f"Remote engine {remote_engine_id} not found in "
+                             f"registered agents")
+
+        tp_ratio = (self._tp_size[self.engine_id] //
+                    self._tp_size[remote_engine_id])
+        remote_rank = self.tp_rank // tp_ratio
+        if remote_rank not in self._remote_agents[remote_engine_id]:
+            raise ValueError(f"Remote rank {remote_rank} not found for engine "
+                             f"{remote_engine_id}")
+
+        remote_agent_name = self._remote_agents[remote_engine_id][remote_rank]
+        return remote_agent_name, remote_engine_id
+
+    def _deregister_unhealthy_remote(self, remote_agent_name: str,
+                                     remote_engine_id: str):
+        """Gracefully deregister an unhealthy remote agent."""
+        logger.info("Deregistering unhealthy remote agent: %s for engine: %s",
+                    remote_agent_name, remote_engine_id)
+
+        # Remove from remote agents mapping
+        if remote_engine_id in self._remote_agents:
+            for rank, agent_name in list(
+                    self._remote_agents[remote_engine_id].items()):
+                if agent_name == remote_agent_name:
+                    del self._remote_agents[remote_engine_id][rank]
+                    break
+
+            if not self._remote_agents[remote_engine_id]:
+                del self._remote_agents[remote_engine_id]
+                # Also clean up related engine state
+                self._tp_size.pop(remote_engine_id, None)
+                self.dst_num_blocks.pop(remote_engine_id, None)
+                self.dst_xfer_side_handles.pop(remote_engine_id, None)
+                self.kv_caches_base_addr.pop(remote_engine_id, None)
+
+        # Clean up handshake futures if any
+        with self._handshake_lock:
+            self._handshake_futures.pop(remote_engine_id, None)
+
+        try:
+            self.nixl_wrapper.invalidate_remote_agent(remote_agent_name)
+            logger.info("Invalidated remote agent: %s", remote_agent_name)
+        except Exception as e:
+            logger.error("Failed to invalidate remote agent %s: %s",
+                         remote_agent_name, e)
+
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
         """copy recved kv from host buffer to device."""
         assert self.use_host_buffer
@@ -1091,19 +1354,46 @@ class NixlConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = False
+            request_failed = False
+
             for handle, _xfer_stime in handles:
-                xfer_state = self.nixl_wrapper.check_xfer_state(handle)
-                if xfer_state == "DONE":
-                    self.nixl_wrapper.release_xfer_handle(handle)
-                elif xfer_state == "PROC":
-                    in_progress = True
-                    continue
-                else:
-                    raise RuntimeError("Transfer failed with state %s",
-                                       xfer_state)
-            if not in_progress:
+                try:
+                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                    if xfer_state == "DONE":
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                        remote_agent_name, _ = self._get_remote_agent_info(
+                            req_id=req_id)
+                        if remote_agent_name:
+                            self.health_manager.track_success(
+                                remote_agent_name)
+                    elif xfer_state == "PROC":
+                        in_progress = True
+                        continue
+                    else:
+                        raise RuntimeError("Transfer failed with state %s",
+                                           xfer_state)
+                except Exception as e:
+                    if self.exception_handler.is_nixl_exception(e):
+                        try:
+                            self.exception_handler.handle_exception(
+                                e,
+                                f"Transfer check for request {req_id}",
+                                req_id=req_id)
+                            # Exception was handled gracefully
+                            # Clean up failed transfer
+                            with contextlib.suppress(Exception):
+                                self.nixl_wrapper.release_xfer_handle(handle)
+                            request_failed = True
+                        except:
+                            raise
+                    else:
+                        raise
+
+            # Mark request as complete if all handles are done or failed
+            if not in_progress or request_failed:
                 done_req_ids.add(req_id)
                 del transfers[req_id]
+
         return done_req_ids
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
@@ -1233,22 +1523,38 @@ class NixlConnectorWorker:
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
         # Prepare transfer with Nixl.
-        handle = self.nixl_wrapper.make_prepped_xfer(
-            "READ",
-            local_xfer_side_handle,
-            local_block_descs_ids,
-            remote_xfer_side_handle,
-            remote_block_descs_ids,
-            notif_msg=notif_id,
-        )
+        try:
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "READ",
+                local_xfer_side_handle,
+                local_block_descs_ids,
+                remote_xfer_side_handle,
+                remote_block_descs_ids,
+                notif_msg=notif_id,
+            )
 
-        # Begin async xfer.
-        self.nixl_wrapper.transfer(handle)
+            # Begin async xfer.
+            self.nixl_wrapper.transfer(handle)
 
-        # Use handle to check completion in future step().
-        # TODO (NickLucche) surface xfer elapsed time
-        self._recving_transfers[request_id].append(
-            (handle, time.perf_counter()))
+            # Use handle to check completion in future step().
+            # TODO (NickLucche) surface xfer elapsed time
+            self._recving_transfers[request_id].append(
+                (handle, time.perf_counter()))
+        except Exception as e:
+            if self.exception_handler.is_nixl_exception(e):
+                try:
+                    self.exception_handler.handle_exception(
+                        e, f"Transfer preparation/initiation for request "
+                        f"{request_id}",
+                        remote_engine_id=dst_engine_id)
+                    # Exception was handled gracefully
+                    # Don't add to _recving_transfers since the transfer failed
+                except:
+                    # Exception should be re-raised (e.g., client errors)
+                    raise
+            else:
+                # Re-raise non-NIXL errors
+                raise
 
     def _get_block_descs_ids(self,
                              engine_id: str,
