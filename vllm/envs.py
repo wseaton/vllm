@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_NIXL_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5557
+    VLLM_NIXL_CONSECUTIVE_FAILURE_THRESHOLD: int = 10
     VLLM_ALL2ALL_BACKEND: Literal["naive", "pplx",
                                   "deepep_high_throughput",
                                   "deepep_low_latency",
@@ -1207,6 +1208,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Port used for NIXL handshake between remote agents.
     "VLLM_NIXL_SIDE_CHANNEL_PORT":
     lambda: int(os.getenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "5557")),
+
+    # Consecutive failure threshold for marking remote agents as unhealthy.
+    "VLLM_NIXL_CONSECUTIVE_FAILURE_THRESHOLD":
+    lambda: int(os.getenv("VLLM_NIXL_CONSECUTIVE_FAILURE_THRESHOLD", "10")),
 
     # all2all backend for vllm's expert parallel communication
     # Available options:

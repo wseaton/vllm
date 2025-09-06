@@ -135,6 +135,9 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
+        # Rate limiting for WAITING_FOR_REMOTE_KVS debug logs
+        self._waiting_kv_log_counters: dict[str, int] = {}
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         # NOTE: For now we use the same budget for both compute and space.
@@ -346,9 +349,18 @@ class Scheduler(SchedulerInterface):
                     if is_ready:
                         request.status = RequestStatus.WAITING
                     else:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request.request_id)
+                        # Rate-limited logging to reduce noise
+                        req_id = request.request_id
+                        self._waiting_kv_log_counters[req_id] = (
+                            self._waiting_kv_log_counters.get(req_id, 0) + 1)
+
+                        # Log every 100 iterations to reduce spam
+                        if self._waiting_kv_log_counters[req_id] % 100 == 1:
+                            logger.debug(
+                                "%s is still in WAITING_FOR_REMOTE_KVS state "
+                                "(logged %d times).", req_id,
+                                self._waiting_kv_log_counters[req_id])
+
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
@@ -1162,6 +1174,9 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+
+        # Clean up rate limiting counter for WAITING_FOR_REMOTE_KVS logs
+        self._waiting_kv_log_counters.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
@@ -1291,6 +1306,10 @@ class Scheduler(SchedulerInterface):
 
         # Return that we are ready.
         self.finished_recving_kv_req_ids.remove(request.request_id)
+
+        # Clean up rate limiting counter
+        self._waiting_kv_log_counters.pop(request.request_id, None)
+
         return True
 
     def _update_from_kv_xfer_finished(self,
