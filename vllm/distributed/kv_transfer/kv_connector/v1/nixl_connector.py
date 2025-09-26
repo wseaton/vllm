@@ -404,6 +404,11 @@ class NixlConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Get the set of block IDs that failed to load."""
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     def get_kv_connector_stats(self) -> Optional[KVConnectorStats]:
         assert self.connector_worker is not None
         return self.connector_worker.get_kv_connector_stats()
@@ -785,6 +790,9 @@ class NixlConnectorWorker:
         # finish reading before safely freeing the blocks.
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
         self.xfer_stats = NixlKVConnectorStats()
+
+        # Track block IDs that failed to load
+        self._failed_block_ids: set[int] = set()
 
     @staticmethod
     def _nixl_handshake_listener(metadata: NixlAgentMetadata,
@@ -1367,6 +1375,20 @@ class NixlConnectorWorker:
                            failed_recving)
         return done_sending, done_recving
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """
+        Get the set of block IDs that failed to load.
+
+        Returns:
+            Set of block IDs that encountered load errors.
+            Empty set if no load errors occurred.
+        """
+        # Return a copy and clear the set to avoid reporting the same failures
+        # multiple times
+        failed_blocks = self._failed_block_ids.copy()
+        self._failed_block_ids.clear()
+        return failed_blocks
+
     def _get_new_notifs(self) -> set[str]:
         """
         Get req_ids which got a remote xfer message. When multiple consumers
@@ -1453,6 +1475,14 @@ class NixlConnectorWorker:
 
             elif failed_markers:
                 failure_details = failed_markers[0]
+
+                # Track failed block IDs for this request
+                if req_id in self._recving_metadata:
+                    meta = self._recving_metadata[req_id]
+                    self._failed_block_ids.update(meta.local_block_ids)
+                    logger.debug(
+                        "Tracking failed block IDs for request %s: %s", req_id,
+                        meta.local_block_ids)
 
                 if failure_details.reason in (FailureReason.NETWORK_ERROR,
                                               FailureReason.HANDSHAKE_FAILED):
@@ -1680,6 +1710,13 @@ class NixlConnectorWorker:
             else:
                 logger.error("Non-retryable transfer failure for request %s",
                              request_id)
+
+            # Track failed block IDs before failing
+            if request_id in self._recving_metadata:
+                meta = self._recving_metadata[request_id]
+                self._failed_block_ids.update(meta.local_block_ids)
+                logger.debug("Tracking failed block IDs for request %s: %s",
+                             request_id, meta.local_block_ids)
 
             # Hard fail instead of soft fail
             raise RuntimeError(
