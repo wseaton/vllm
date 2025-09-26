@@ -1439,6 +1439,13 @@ class NixlConnectorWorker:
             logger.debug("_pop_done_transfers checking %d requests: %s",
                          len(transfers), list(transfers.keys()))
         for req_id, handles in list(transfers.items()):
+            # Skip requests with empty handles list (defensive)
+            if not handles:
+                logger.warning("Request %s has empty handles list, removing",
+                               req_id)
+                del transfers[req_id]
+                continue
+
             in_progress = False
             failed_markers = []
             completed_handles = []
@@ -1729,8 +1736,9 @@ class NixlConnectorWorker:
                 logger.debug("Tracking failed block IDs for request %s: %s",
                              request_id, meta.local_block_ids)
 
-            # Clean up retry tracking for failed transfers
+            # Clean up retry tracking and transfer state for failed transfers
             self._failed_recv_attempts.pop(request_id, None)
+            self._recving_transfers.pop(request_id, None)
 
             # Hard fail instead of soft fail
             raise RuntimeError(
