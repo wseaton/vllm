@@ -443,6 +443,12 @@ class NixlConnector(KVConnectorBase_V1):
            self.connector_worker.copy_blocks:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
 
+    def clear_connector_metadata(self) -> None:
+        """Clear the connector metadata and failed block IDs."""
+        super().clear_connector_metadata()
+        if self.connector_worker is not None:
+            self.connector_worker.clear_failed_block_ids()
+
     def shutdown(self):
         if self.connector_worker is not None:
             self.connector_worker.shutdown()
@@ -1383,11 +1389,13 @@ class NixlConnectorWorker:
             Set of block IDs that encountered load errors.
             Empty set if no load errors occurred.
         """
-        # Return a copy and clear the set to avoid reporting the same failures
-        # multiple times
-        failed_blocks = self._failed_block_ids.copy()
+        # Return a copy of failed block IDs (they will be cleared
+        # in clear_connector_metadata)
+        return self._failed_block_ids.copy()
+
+    def clear_failed_block_ids(self) -> None:
+        """Clear the set of failed block IDs."""
         self._failed_block_ids.clear()
-        return failed_blocks
 
     def _get_new_notifs(self) -> set[str]:
         """
@@ -1476,13 +1484,16 @@ class NixlConnectorWorker:
             elif failed_markers:
                 failure_details = failed_markers[0]
 
-                # Track failed block IDs for this request
+                # Track failed block IDs for this request and clean up metadata
                 if req_id in self._recving_metadata:
-                    meta = self._recving_metadata[req_id]
+                    meta = self._recving_metadata.pop(req_id)
                     self._failed_block_ids.update(meta.local_block_ids)
                     logger.debug(
                         "Tracking failed block IDs for request %s: %s", req_id,
                         meta.local_block_ids)
+
+                # Clean up retry tracking for failed transfers
+                self._failed_recv_attempts.pop(req_id, None)
 
                 if failure_details.reason in (FailureReason.NETWORK_ERROR,
                                               FailureReason.HANDSHAKE_FAILED):
@@ -1711,12 +1722,15 @@ class NixlConnectorWorker:
                 logger.error("Non-retryable transfer failure for request %s",
                              request_id)
 
-            # Track failed block IDs before failing
+            # Track failed block IDs and clean up metadata before failing
             if request_id in self._recving_metadata:
-                meta = self._recving_metadata[request_id]
+                meta = self._recving_metadata.pop(request_id)
                 self._failed_block_ids.update(meta.local_block_ids)
                 logger.debug("Tracking failed block IDs for request %s: %s",
                              request_id, meta.local_block_ids)
+
+            # Clean up retry tracking for failed transfers
+            self._failed_recv_attempts.pop(request_id, None)
 
             # Hard fail instead of soft fail
             raise RuntimeError(
