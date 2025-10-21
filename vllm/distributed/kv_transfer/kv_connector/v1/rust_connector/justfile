@@ -1,0 +1,96 @@
+# Rust KV Connector Development Commands
+
+# default recipe to display help information
+default:
+    @just --list
+
+# find the venv path (look in project root)
+venv_path := env_var_or_default('VIRTUAL_ENV', absolute_path(justfile_directory() + '/../../../../../../.venv'))
+
+# build in debug mode
+build:
+    VIRTUAL_ENV={{venv_path}} maturin develop
+
+# build in release mode
+build-release:
+    VIRTUAL_ENV={{venv_path}} maturin develop --release
+
+# run Rust unit tests (note: requires pyo3 test setup)
+test-rust:
+    @echo "⚠️  Rust tests for PyO3 crates require special setup and are skipped"
+    @echo "    Run Python tests instead with: just test-py"
+    # cargo test would fail due to PyO3 FFI requirements
+
+# run Python unit tests
+test-py: build
+    {{venv_path}}/bin/pytest ../../../../../tests/v1/kv_connector/unit/test_rust_connector.py -v
+
+# run all tests (just Python tests for now)
+test: test-py
+
+# quick smoke test of the Rust module
+smoke-test: build
+    {{venv_path}}/bin/python -c "import vllm_rust_kv; print('✓ Import successful')"
+    {{venv_path}}/bin/python -c "import vllm_rust_kv; c = vllm_rust_kv.RustKVConnector('worker'); print(f'✓ Created: {c}')"
+
+# clean build artifacts
+clean:
+    cargo clean
+    rm -rf target/
+    rm -rf *.egg-info
+    find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# format Rust code
+fmt:
+    cargo fmt
+
+# check Rust code formatting
+fmt-check:
+    cargo fmt --check
+
+# run clippy linter
+lint:
+    cargo clippy -- -D warnings
+
+# check everything (format, lint)
+check: fmt-check lint
+
+# install required tools
+install-tools:
+    cargo install maturin
+    uv pip install pytest numpy torch
+
+# benchmark the Rust store operations
+bench: build
+    #!/usr/bin/env {{venv_path}}/bin/python
+    import vllm_rust_kv
+    import numpy as np
+    import time
+
+    conn = vllm_rust_kv.RustKVConnector('worker')
+
+    # benchmark store operations
+    num_ops = 1000
+    data = np.random.randn(2, 128, 128).astype(np.float32)
+    data_bytes = data.tobytes()
+
+    start = time.time()
+    for i in range(num_ops):
+        conn.store_kv(f'req_{i}', 'layer_0', data_bytes, list(data.shape), 'float32')
+    store_time = time.time() - start
+
+    # benchmark load operations
+    start = time.time()
+    for i in range(num_ops):
+        result = conn.load_kv(f'req_{i}', 'layer_0')
+    load_time = time.time() - start
+
+    print(f"Store: {num_ops} ops in {store_time:.3f}s ({num_ops/store_time:.0f} ops/s)")
+    print(f"Load:  {num_ops} ops in {load_time:.3f}s ({num_ops/load_time:.0f} ops/s)")
+    print(f"Total size: {conn.size()} entries")
+
+# full rebuild from scratch
+rebuild: clean build
+
+# development workflow: format, build, test
+dev: fmt build test-py

@@ -1,0 +1,31 @@
+[package]
+name = "vllm-kv-connector-rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "vllm_nixl"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = "0.22"
+numpy = "0.22"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tracing = "0.1"
+
+# nixl rust bindings - path will need to be configured
+# users should build nixl with rust bindings and point to the installation
+nixl-sys = { path = "/tmp/nixl/src/bindings/rust", optional = true }
+
+[features]
+default = []
+# enable NIXL support (requires nixl-sys dependency)
+nixl = ["dep:nixl-sys"]
+# enable extension-module for Python builds (not needed for tests)
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+lto = true
+codegen-units = 1
