@@ -15,9 +15,8 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tracing = "0.1"
 
-# nixl rust bindings - path will need to be configured
-# users should build nixl with rust bindings and point to the installation
-nixl-sys = { path = "/tmp/nixl/src/bindings/rust", optional = true }
+# NIXL Rust bindings
+nixl-sys = { path = "/home/wseaton/vllm/nixl_installer_latest/nixl-0.6.1/src/bindings/rust", optional = true }
 
 [features]
 default = []

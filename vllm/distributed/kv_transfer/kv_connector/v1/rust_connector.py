@@ -31,11 +31,17 @@ try:
 
     NixlAgent = vllm_nixl.NixlAgent
     TcpSideChannel = vllm_nixl.TcpSideChannel
+    ConnectorScheduler = vllm_nixl.ConnectorScheduler
+    ConnectorWorker = vllm_nixl.ConnectorWorker
+    RequestMeta = vllm_nixl.RequestMeta
     NIXL_AVAILABLE = True
 except ImportError:
     NIXL_AVAILABLE = False
     NixlAgent = None  # type: ignore
     TcpSideChannel = None  # type: ignore
+    ConnectorScheduler = None  # type: ignore
+    ConnectorWorker = None  # type: ignore
+    RequestMeta = None  # type: ignore
 
 logger = init_logger(__name__)
 
@@ -64,6 +70,31 @@ def _str_to_torch_dtype(dtype_str: str) -> torch.dtype:
     return mapping.get(dtype_str, torch.float32)
 
 
+class RustConnectorMetadata(KVConnectorMetadata):
+    """
+    Metadata for Rust-based KV transfers, matching the structure
+    returned by ConnectorScheduler.build_connector_meta()
+    """
+    def __init__(self, rust_dict: dict[str, Any]):
+        """
+        Initialize from Rust-generated dictionary.
+
+        Expected structure:
+        {
+            "reqs_to_recv": {req_id: RequestMeta, ...},
+            "reqs_to_save": {req_id: RequestMeta, ...},
+            "reqs_to_send": {req_id: expiration_timestamp, ...},
+            "reqs_in_batch": [req_id, ...],
+            "reqs_not_processed": [req_id, ...]
+        }
+        """
+        self.reqs_to_recv: dict[str, Any] = rust_dict.get("reqs_to_recv", {})
+        self.reqs_to_save: dict[str, Any] = rust_dict.get("reqs_to_save", {})
+        self.reqs_to_send: dict[str, float] = rust_dict.get("reqs_to_send", {})
+        self.reqs_in_batch: set[str] = set(rust_dict.get("reqs_in_batch", []))
+        self.reqs_not_processed: set[str] = set(rust_dict.get("reqs_not_processed", []))
+
+
 class RustKVConnectorV1(KVConnectorBase_V1):
     """
     KV Connector backed by NIXL with Rust implementation.
@@ -81,34 +112,95 @@ class RustKVConnectorV1(KVConnectorBase_V1):
 
         super().__init__(vllm_config=vllm_config, role=role)
 
-        role_str = "scheduler" if role == KVConnectorRole.SCHEDULER else "worker"
-        # TODO: Initialize NIXL agent here instead of simple in-memory store
-        # For now, we'll keep the basic structure but note that it needs NIXL integration
+        self._role = role
         self._block_size = vllm_config.cache_config.block_size
 
-        # scheduler-side tracking
-        self._requests_need_load: dict[str, "Request"] = {}
+        # Get engine and network configuration
+        kv_transfer_config = vllm_config.kv_transfer_config
+        engine_id = kv_transfer_config.kv_connector_extra_config.get("engine_id", "vllm_engine")
+        side_channel_host = kv_transfer_config.kv_connector_extra_config.get("side_channel_host", "localhost")
 
-        logger.info(f"Initialized Rust KV Connector with NIXL support (role={role_str})")
+        # Calculate side channel port based on DP and TP ranks
+        # Base port + DP rank * TP size + TP rank
+        parallel_config = vllm_config.parallel_config
+        base_port = kv_transfer_config.kv_connector_extra_config.get("side_channel_base_port", 45000)
+        dp_rank = getattr(parallel_config, 'dp_rank', 0)
+        tp_size = parallel_config.tensor_parallel_size
+        tp_rank = parallel_config.rank % tp_size
+        side_channel_port = base_port + dp_rank * tp_size + tp_rank
+
+        if role == KVConnectorRole.SCHEDULER:
+            # Initialize Rust scheduler
+            self._scheduler = ConnectorScheduler(
+                engine_id=engine_id,
+                block_size=self._block_size,
+                side_channel_host=side_channel_host,
+                side_channel_port=side_channel_port
+            )
+            self._worker = None
+            logger.info(f"Initialized Rust KV Connector Scheduler (engine={engine_id}, port={side_channel_port})")
+        else:
+            # Initialize Rust worker
+            self._scheduler = None
+            self._worker = ConnectorWorker(
+                engine_id=engine_id,
+                tp_rank=tp_rank,
+                block_size=self._block_size,
+                side_channel_host=side_channel_host,
+                side_channel_port=side_channel_port
+            )
+
+            # Initialize NIXL agent for worker
+            # TODO: Get NIXL config from vllm_config
+            nixl_config = {
+                "enable_prog_thread": True,
+                "num_workers": 4,
+            }
+            agent_name = f"{engine_id}_rank_{tp_rank}"
+            self._nixl_agent = NixlAgent(agent_name, nixl_config)
+
+            logger.info(f"Initialized Rust KV Connector Worker (engine={engine_id}, tp_rank={tp_rank})")
 
     # ==============================
     # Worker-side methods
     # ==============================
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Register KV caches with NIXL for GPU-to-GPU transfers"""
+        if self._worker is None:
+            logger.warning("Worker not initialized, skipping KV cache registration")
+            return
+
+        # Call Rust worker to register KV caches
+        self._worker.register_kv_caches(kv_caches, self._nixl_agent)
+        logger.info(f"Registered {len(kv_caches)} KV cache layers with NIXL")
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """load KV cache via NIXL transfer into vLLM's paged buffer"""
-        # TODO: Implement NIXL-based KV loading
-        # 1. Get metadata with remote engine info
-        # 2. Initiate handshake if needed (via TcpSideChannel)
-        # 3. Start NIXL transfer for KV blocks
-        # 4. Poll for completion
-        # 5. Inject received blocks into paged buffer
-        logger.warning("start_load_kv: NIXL integration not yet implemented")
-        pass
+        if self._worker is None:
+            return
+
+        # Get connector metadata from forward context
+        connector_meta = getattr(forward_context, 'connector_meta', None)
+        if connector_meta is None:
+            return
+
+        # Convert metadata to dict for Rust
+        metadata_dict = {
+            "reqs_to_recv": connector_meta.reqs_to_recv if hasattr(connector_meta, 'reqs_to_recv') else {},
+            "reqs_to_save": connector_meta.reqs_to_save if hasattr(connector_meta, 'reqs_to_save') else {},
+            "reqs_to_send": connector_meta.reqs_to_send if hasattr(connector_meta, 'reqs_to_send') else {},
+            "reqs_in_batch": list(connector_meta.reqs_in_batch) if hasattr(connector_meta, 'reqs_in_batch') else [],
+            "reqs_not_processed": list(connector_meta.reqs_not_processed) if hasattr(connector_meta, 'reqs_not_processed') else [],
+        }
+
+        # Call Rust worker to start loading KV
+        self._worker.start_load_kv(metadata_dict)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """no async loading in this simple implementation"""
-        return
+        """Wait for a specific layer to finish loading (no-op for NIXL)"""
+        # NIXL handles transfers asynchronously, polling happens in get_finished_transfers
+        pass
 
     def save_kv_layer(
         self,
@@ -125,7 +217,23 @@ class RustKVConnectorV1(KVConnectorBase_V1):
 
     def wait_for_save(self):
         """no async saving in this simple implementation"""
-        return
+        pass
+
+    def get_finished_transfers(self) -> tuple[set[str], set[str]]:
+        """Poll for finished KV transfers (receiving and sending)"""
+        if self._worker is None:
+            return set(), set()
+
+        # Call Rust worker to poll for finished transfers
+        return self._worker.get_finished()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Get block IDs that failed to load"""
+        if self._worker is None:
+            return set()
+
+        # Call Rust worker to get error blocks
+        return self._worker.get_block_ids_with_load_errors()
 
     # ==============================
     # Scheduler-side methods
@@ -137,52 +245,51 @@ class RustKVConnectorV1(KVConnectorBase_V1):
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         """check if request has remote KV cache available"""
+        if self._scheduler is None:
+            return 0, False
+
         # Check if request has kv_transfer_params indicating remote KV
         if request.kv_transfer_params is None:
             return 0, False
 
-        # For requests with remote KV, calculate how many tokens to load
-        num_prompt_tokens = len(request.prompt_token_ids or [])
-        num_external_tokens = num_prompt_tokens - num_computed_tokens
-
-        if num_external_tokens > 0:
-            logger.info(
-                f"Request {request.request_id} can load {num_external_tokens} "
-                f"tokens from remote KV cache"
-            )
-            # Return external tokens and async=False (sync loading for now)
-            return num_external_tokens, False
-
-        return 0, False
+        # Call Rust scheduler implementation
+        return self._scheduler.get_num_new_matched_tokens(
+            request.request_id,
+            num_computed_tokens,
+            request.kv_transfer_params
+        )
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         """mark request for loading if it has external tokens"""
-        if num_external_tokens > 0:
-            self._requests_need_load[request.request_id] = request
+        if self._scheduler is None or num_external_tokens == 0:
+            return
+
+        # Extract block IDs from KVCacheBlocks
+        block_ids = blocks.block_ids if hasattr(blocks, 'block_ids') else []
+
+        # Call Rust scheduler implementation
+        self._scheduler.update_state_after_alloc(
+            request.request_id,
+            list(block_ids),
+            num_external_tokens,
+            request.kv_transfer_params or {}
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         """build metadata for worker to load/save KV"""
-        # TODO: Create proper metadata class for NIXL connector
-        # For now, return a simple placeholder
-        class SimpleMetadata(KVConnectorMetadata):
-            def __init__(self):
-                self.requests_to_load = {}
-                self.requests_to_save = {}
+        if self._scheduler is None:
+            # Return empty metadata if no scheduler
+            return RustConnectorMetadata({})
 
-        meta = SimpleMetadata()
+        # Call Rust scheduler to build metadata
+        rust_dict = self._scheduler.build_connector_meta()
 
-        # Track requests that need to load from remote KV
-        for req_id, request in self._requests_need_load.items():
-            if request.kv_transfer_params:
-                meta.requests_to_load[req_id] = request.kv_transfer_params
-
-        self._requests_need_load.clear()
-
-        return meta
+        # Wrap in Python metadata class
+        return RustConnectorMetadata(rust_dict)
 
     def request_finished(
         self,
@@ -190,6 +297,12 @@ class RustKVConnectorV1(KVConnectorBase_V1):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """cleanup when request finishes"""
-        # TODO: Implement NIXL cleanup if needed
-        # For now, just return False to indicate vLLM should free blocks
-        return False, None
+        if self._scheduler is None:
+            return False, None
+
+        # Call Rust scheduler to handle request completion
+        return self._scheduler.request_finished(
+            request.request_id,
+            block_ids,
+            request.kv_transfer_params
+        )

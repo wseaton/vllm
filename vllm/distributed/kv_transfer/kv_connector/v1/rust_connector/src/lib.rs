@@ -16,7 +16,12 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
 pub mod side_channel;
+pub mod scheduler;
+pub mod worker;
+
 use side_channel::SideChannel;
+use scheduler::{ConnectorScheduler, RequestMeta};
+use worker::ConnectorWorker;
 
 #[cfg(feature = "nixl")]
 use nixl_sys::{
@@ -756,6 +761,9 @@ impl TcpSideChannel {
 fn vllm_nixl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NixlAgent>()?;
     m.add_class::<TcpSideChannel>()?;
+    m.add_class::<ConnectorScheduler>()?;
+    m.add_class::<ConnectorWorker>()?;
+    m.add_class::<RequestMeta>()?;
     m.add_function(wrap_pyfunction!(nixl_agent_config, m)?)?;
     Ok(())
 }
