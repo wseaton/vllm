@@ -41,6 +41,12 @@ fn serve_args_forward_python_flags_with_separator() {
                         max_logprobs: None,
                         grpc_port: None,
                         shutdown_timeout: 0,
+                        ssl_keyfile: None,
+                        ssl_certfile: None,
+                        ssl_ca_certs: None,
+                        ssl_cert_reqs: 0,
+                        ssl_ciphers: None,
+                        enable_ssl_refresh: false,
                         chat_template: None,
                         default_chat_template_kwargs: None,
                         chat_template_content_format: Auto,
@@ -356,13 +362,13 @@ fn serve_args_reject_unsupported_flag_arg() {
         "vllm-rs",
         "serve",
         "Qwen/Qwen3-0.6B",
-        "--ssl-keyfile",
-        "/tmp/key.pem",
+        "--root-path",
+        "/prefix",
     ])
     .unwrap_err();
 
     expect![[r#"
-        error: invalid value '/tmp/key.pem' for '--ssl-keyfile <SSL_KEYFILE>': argument is not implemented in Rust frontend yet
+        error: invalid value '/prefix' for '--root-path <ROOT_PATH>': argument is not implemented in Rust frontend yet
 
         Remove this unsupported argument to continue.
 
@@ -437,6 +443,12 @@ fn frontend_args_accept_json() {
                         max_logprobs: None,
                         grpc_port: None,
                         shutdown_timeout: 0,
+                        ssl_keyfile: None,
+                        ssl_certfile: None,
+                        ssl_ca_certs: None,
+                        ssl_cert_reqs: 0,
+                        ssl_ciphers: None,
+                        enable_ssl_refresh: false,
                         chat_template: None,
                         default_chat_template_kwargs: None,
                         chat_template_content_format: Auto,
@@ -673,14 +685,14 @@ fn frontend_args_json_rejects_unsupported_fields() {
         "--output-address",
         "ipc:///tmp/output.sock",
         "--args-json",
-        r#"{"model_tag":"Qwen/Qwen3-0.6B","ssl_keyfile":"/tmp/key.pem"}"#,
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant"}"#,
     ])
     .unwrap_err();
 
     expect![[r#"
-        error: invalid value '{"model_tag":"Qwen/Qwen3-0.6B","ssl_keyfile":"/tmp/key.pem"}' for '--args-json <JSON>': 
+        error: invalid value '{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant"}' for '--args-json <JSON>': 
         The following arguments are not implemented in Rust frontend yet:
-        - ssl_keyfile
+        - response_role
 
         Remove these arguments to continue.
 
@@ -700,16 +712,16 @@ fn frontend_args_json_aggregates_multiple_unsupported_fields() {
         "--output-address",
         "ipc:///tmp/output.sock",
         "--args-json",
-        r#"{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant","ssl_keyfile":"/tmp/key.pem"}"#,
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant","root_path":"/prefix"}"#,
     ])
     .unwrap_err();
 
     let actual = error.to_string().replace(": \n", ":\n");
     expect![[r#"
-        error: invalid value '{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant","ssl_keyfile":"/tmp/key.pem"}' for '--args-json <JSON>':
+        error: invalid value '{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant","root_path":"/prefix"}' for '--args-json <JSON>':
         The following arguments are not implemented in Rust frontend yet:
         - response_role
-        - ssl_keyfile
+        - root_path
 
         Remove these arguments to continue.
 
@@ -925,6 +937,12 @@ fn serve_args_accept_handshake_aliases() {
                         max_logprobs: None,
                         grpc_port: None,
                         shutdown_timeout: 0,
+                        ssl_keyfile: None,
+                        ssl_certfile: None,
+                        ssl_ca_certs: None,
+                        ssl_cert_reqs: 0,
+                        ssl_ciphers: None,
+                        enable_ssl_refresh: false,
                         chat_template: None,
                         default_chat_template_kwargs: None,
                         chat_template_content_format: Auto,
@@ -1057,6 +1075,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
                 host: "127.0.0.1",
                 port: 8000,
             },
+            tls: None,
             tool_call_parser: Auto,
             reasoning_parser: Auto,
             renderer: Auto,
@@ -1138,6 +1157,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
                 host: "127.0.0.1",
                 port: 8000,
             },
+            tls: None,
             tool_call_parser: Auto,
             reasoning_parser: Auto,
             renderer: Auto,
@@ -1237,6 +1257,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             listener_mode: InheritedFd {
                 fd: 3,
             },
+            tls: None,
             tool_call_parser: Auto,
             reasoning_parser: Auto,
             renderer: Auto,

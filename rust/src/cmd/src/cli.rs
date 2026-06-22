@@ -24,7 +24,7 @@ use vllm_managed_engine::ManagedEngineConfig;
 use vllm_managed_engine::cli::{ManagedEngineArgs, repartition_managed_engine_args};
 use vllm_server::{
     ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
-    HttpListenerMode, ParserSelection, RendererSelection,
+    HttpListenerMode, ParserSelection, RendererSelection, TlsConfig,
 };
 
 use crate::cli::unsupported::UnsupportedArgs;
@@ -148,6 +148,33 @@ pub struct SharedRuntimeArgs {
     #[arg(long, default_value_t = 0)]
     #[serde(default)]
     pub shutdown_timeout: u64,
+
+    /// The file path to the SSL key file (enables HTTPS together with
+    /// --ssl-certfile). Requires the openssl build.
+    #[arg(long)]
+    #[serde(default)]
+    pub ssl_keyfile: Option<String>,
+    /// The file path to the SSL cert file.
+    #[arg(long)]
+    #[serde(default)]
+    pub ssl_certfile: Option<String>,
+    /// CA certificates file for verifying client certificates (mTLS).
+    #[arg(long)]
+    #[serde(default)]
+    pub ssl_ca_certs: Option<String>,
+    /// Client certificate requirement: 0=none, 1=optional, 2=required
+    /// (stdlib ssl.CERT_*).
+    #[arg(long, default_value_t = 0)]
+    #[serde(default)]
+    pub ssl_cert_reqs: u32,
+    /// OpenSSL cipher list for HTTPS (TLS 1.2 and below only).
+    #[arg(long)]
+    #[serde(default)]
+    pub ssl_ciphers: Option<String>,
+    /// Reload the SSL certificates when the files change on disk.
+    #[arg(long, default_value_t = false)]
+    #[serde(default)]
+    pub enable_ssl_refresh: bool,
 
     /// The file path to the chat template, or the template in single-line form
     /// for the specified model.
@@ -297,6 +324,7 @@ impl SharedRuntimeArgs {
         let shutdown_timeout = self.shutdown_timeout();
         let api_server_options = self.api_server_options();
         let cors = self.cors_config();
+        let tls = self.tls_config();
 
         Config {
             transport_mode: TransportMode::Bootstrapped {
@@ -313,6 +341,7 @@ impl SharedRuntimeArgs {
             model: self.model,
             served_model_name: self.served_model_name,
             listener_mode: HttpListenerMode::InheritedFd { fd: listen_fd },
+            tls,
             tool_call_parser: self.tool_call_parser,
             reasoning_parser: self.reasoning_parser,
             renderer: self.renderer,
@@ -345,6 +374,7 @@ impl SharedRuntimeArgs {
         let shutdown_timeout = self.shutdown_timeout();
         let api_server_options = self.api_server_options();
         let cors = self.cors_config();
+        let tls = self.tls_config();
 
         Config {
             transport_mode: TransportMode::HandshakeOwner {
@@ -359,6 +389,7 @@ impl SharedRuntimeArgs {
             model: self.model,
             served_model_name: self.served_model_name,
             listener_mode,
+            tls,
             tool_call_parser: self.tool_call_parser,
             reasoning_parser: self.reasoning_parser,
             renderer: self.renderer,
@@ -391,6 +422,25 @@ impl SharedRuntimeArgs {
             allow_headers: self.allowed_headers.0.clone(),
             allow_credentials: self.allow_credentials,
         }
+    }
+
+    /// Build the TLS termination config when any `ssl_*` argument is set. Missing
+    /// key/cert paths are left empty here and rejected by `Config::validate`.
+    fn tls_config(&self) -> Option<TlsConfig> {
+        let intended = self.ssl_keyfile.is_some()
+            || self.ssl_certfile.is_some()
+            || self.ssl_ca_certs.is_some()
+            || self.ssl_ciphers.is_some()
+            || self.ssl_cert_reqs != 0
+            || self.enable_ssl_refresh;
+        intended.then(|| TlsConfig {
+            keyfile: self.ssl_keyfile.clone().unwrap_or_default(),
+            certfile: self.ssl_certfile.clone().unwrap_or_default(),
+            ca_certs: self.ssl_ca_certs.clone(),
+            cert_reqs: self.ssl_cert_reqs,
+            ciphers: self.ssl_ciphers.clone(),
+            enable_refresh: self.enable_ssl_refresh,
+        })
     }
 }
 

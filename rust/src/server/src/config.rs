@@ -99,6 +99,25 @@ impl CorsConfig {
     }
 }
 
+/// Inbound TLS termination settings, mirroring Python's `ssl_*` server args.
+/// Only honored in the `openssl` build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    /// PEM private key file.
+    pub keyfile: String,
+    /// PEM certificate chain file.
+    pub certfile: String,
+    /// PEM CA bundle for verifying client certificates (mTLS).
+    pub ca_certs: Option<String>,
+    /// Client-certificate verification mode, matching stdlib `ssl.CERT_*`:
+    /// `0` none, `1` optional, `2` required.
+    pub cert_reqs: u32,
+    /// OpenSSL cipher-list string for TLS <=1.2.
+    pub ciphers: Option<String>,
+    /// Reload the certificate chain / CA when the files change on disk.
+    pub enable_refresh: bool,
+}
+
 /// Normalized runtime configuration for the minimal OpenAI-compatible server.
 #[derive(Educe, Clone, PartialEq, Eq, Serialize)]
 #[educe(Debug)]
@@ -115,6 +134,9 @@ pub struct Config {
     pub served_model_name: Vec<String>,
     /// HTTP listener setup.
     pub listener_mode: HttpListenerMode,
+    /// Optional inbound TLS termination. `None` serves plaintext HTTP.
+    #[serde(skip)]
+    pub tls: Option<TlsConfig>,
     /// Tool-call parser selection.
     pub tool_call_parser: ParserSelection,
     /// Reasoning parser selection.
@@ -167,6 +189,50 @@ impl Config {
             );
         }
 
+        if let Some(tls) = &self.tls {
+            self.validate_tls(tls)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "openssl"))]
+    fn validate_tls(&self, _tls: &TlsConfig) -> Result<()> {
+        bail!(
+            "TLS termination requires the openssl build \
+             (--no-default-features --features openssl)"
+        )
+    }
+
+    #[cfg(feature = "openssl")]
+    fn validate_tls(&self, tls: &TlsConfig) -> Result<()> {
+        use std::path::Path;
+
+        if matches!(self.listener_mode, HttpListenerMode::BindUnix { .. }) {
+            bail!("TLS termination is not supported on Unix-domain sockets");
+        }
+        if tls.keyfile.is_empty() || tls.certfile.is_empty() {
+            bail!("both ssl_keyfile and ssl_certfile are required to enable TLS");
+        }
+        for (label, path) in [
+            ("ssl_certfile", &tls.certfile),
+            ("ssl_keyfile", &tls.keyfile),
+        ] {
+            if !Path::new(path).is_file() {
+                bail!("{label} not found: {path}");
+            }
+        }
+        if let Some(ca) = &tls.ca_certs
+            && !Path::new(ca).is_file()
+        {
+            bail!("ssl_ca_certs not found: {ca}");
+        }
+        if tls.cert_reqs > 2 {
+            bail!("ssl_cert_reqs must be 0, 1, or 2, got {}", tls.cert_reqs);
+        }
+        if tls.cert_reqs > 0 && tls.ca_certs.is_none() {
+            bail!("ssl_cert_reqs > 0 requires ssl_ca_certs to verify client certificates");
+        }
         Ok(())
     }
 

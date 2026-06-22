@@ -9,6 +9,8 @@ mod middleware;
 mod routes;
 mod server_info;
 mod state;
+#[cfg(feature = "openssl")]
+mod tls;
 mod utils;
 
 use std::sync::{Arc, OnceLock};
@@ -16,7 +18,9 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result};
 use axum::Router;
 use axum::serve::ListenerExt as _;
-pub use config::{ApiServerOptions, Config, CoordinatorMode, CorsConfig, HttpListenerMode};
+pub use config::{
+    ApiServerOptions, Config, CoordinatorMode, CorsConfig, HttpListenerMode, TlsConfig,
+};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, sleep_until};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -164,16 +168,6 @@ where
 
     info!(%bind_address, %model, "starting OpenAI server");
 
-    // Set TCP_NODELAY on accepted connections to reduce latency.
-    // By `tap_io` we will do this on every accepted connection.
-    let listener = listener.tap_io(|io| {
-        if let Either::Left(tcp_stream) = io
-            && let Err(err) = tcp_stream.set_nodelay(true)
-        {
-            trace!(error = %err, "failed to enable TCP_NODELAY on accepted HTTP connection");
-        }
-    });
-
     // Run HTTP and gRPC concurrently under a child token of the caller's shutdown
     // token. Caller cancellation propagates into both protocols; if either
     // protocol exits first, we cancel this child token so its sibling also
@@ -203,27 +197,51 @@ where
         }
     });
 
+    // Plaintext HTTP via `axum::serve`, or (openssl build) TLS termination via a
+    // spawned-per-connection accept loop when `config.tls` is set.
+    #[cfg(feature = "openssl")]
+    let http_fut = match config.tls.clone() {
+        Some(tls_cfg) => {
+            let acceptor: Arc<dyn tls::TlsAcceptor> =
+                tls::OpensslAcceptor::new(&tls_cfg).context("failed to build TLS acceptor")?;
+            let tcp = match listener {
+                Listener::Tcp(tcp) => tcp,
+                Listener::Unix(_) => anyhow::bail!("TLS termination requires a TCP listener"),
+            };
+            if tls_cfg.enable_refresh {
+                tls::spawn_refresher(acceptor.clone(), server_shutdown.clone());
+            }
+            let shutdown = server_shutdown.child_token();
+            Either::Left(serve_http_tls(
+                tcp,
+                app,
+                acceptor,
+                shutdown,
+                server_shutdown.clone(),
+                force_shutdown.clone(),
+            ))
+        }
+        None => {
+            let shutdown = server_shutdown.child_token();
+            Either::Right(serve_http_plain(
+                listener,
+                app,
+                shutdown,
+                server_shutdown.clone(),
+                force_shutdown.clone(),
+            ))
+        }
+    };
+    #[cfg(not(feature = "openssl"))]
     let http_fut = {
         let shutdown = server_shutdown.child_token();
-        let server_shutdown = server_shutdown.clone();
-        let force_shutdown = force_shutdown.clone();
-        async move {
-            let server =
-                axum::serve(listener, app).with_graceful_shutdown(shutdown.cancelled_owned());
-
-            let result = tokio::select! {
-                result = server => {
-                    result.context("HTTP server failed")
-                }
-                _ = force_shutdown.cancelled() => {
-                    warn!("HTTP graceful shutdown deadline elapsed; aborting server");
-                    Ok(())
-                }
-            };
-
-            server_shutdown.cancel();
-            result
-        }
+        serve_http_plain(
+            listener,
+            app,
+            shutdown,
+            server_shutdown.clone(),
+            force_shutdown.clone(),
+        )
     };
 
     let grpc_fut = {
@@ -267,6 +285,150 @@ where
     state.shutdown(shutdown_deadline).await
 }
 
+/// Serve plaintext HTTP via `axum::serve`, draining gracefully on `shutdown` and
+/// aborting if `force_shutdown` (the deadline) fires first.
+async fn serve_http_plain(
+    listener: Listener,
+    app: Router,
+    shutdown: CancellationToken,
+    server_shutdown: CancellationToken,
+    force_shutdown: CancellationToken,
+) -> Result<()> {
+    // TCP_NODELAY on every accepted connection; don't let Nagle sit on small replies.
+    let listener = listener.tap_io(|io| {
+        if let Either::Left(tcp_stream) = io
+            && let Err(err) = tcp_stream.set_nodelay(true)
+        {
+            trace!(error = %err, "failed to enable TCP_NODELAY on accepted HTTP connection");
+        }
+    });
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown.cancelled_owned());
+    let result = tokio::select! {
+        result = server => result.context("HTTP server failed"),
+        _ = force_shutdown.cancelled() => {
+            warn!("HTTP graceful shutdown deadline elapsed; aborting server");
+            Ok(())
+        }
+    };
+    server_shutdown.cancel();
+    result
+}
+
+/// Serve HTTPS by terminating TLS per connection on a spawned task (no
+/// head-of-line blocking on slow handshakes), then driving the axum router over
+/// the decrypted stream via hyper. Drains in-flight connections on `shutdown`
+/// until `force_shutdown` elapses.
+#[cfg(feature = "openssl")]
+async fn serve_http_tls(
+    tcp: TcpListener,
+    app: Router,
+    acceptor: Arc<dyn tls::TlsAcceptor>,
+    shutdown: CancellationToken,
+    server_shutdown: CancellationToken,
+    force_shutdown: CancellationToken,
+) -> Result<()> {
+    use std::time::Duration;
+
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use tokio_util::task::TaskTracker;
+
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+    let conns = TaskTracker::new();
+
+    loop {
+        let (sock, peer) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accept = tcp.accept() => match accept {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(%err, "failed to accept HTTPS connection");
+                    continue;
+                }
+            },
+        };
+        if let Err(err) = sock.set_nodelay(true) {
+            trace!(error = %err, "failed to enable TCP_NODELAY on accepted HTTPS connection");
+        }
+
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        let force_shutdown = force_shutdown.clone();
+        conns.spawn(async move {
+            let stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => return log_tls_noise(peer, "TLS handshake error", &err),
+                Err(_) => return tracing::debug!(%peer, "TLS handshake timed out"),
+            };
+
+            let service = TowerToHyperService::new(app);
+            let builder = Builder::new(TokioExecutor::new());
+            let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+            tokio::pin!(conn);
+            let result = tokio::select! {
+                result = conn.as_mut() => result,
+                _ = force_shutdown.cancelled() => return,
+            };
+            if let Err(err) = result {
+                log_conn_noise(peer, &err);
+            }
+        });
+    }
+
+    // Stop accepting and let in-flight connections finish until the deadline.
+    conns.close();
+    tokio::select! {
+        _ = conns.wait() => {}
+        _ = force_shutdown.cancelled() => {
+            warn!("HTTPS graceful shutdown deadline elapsed; aborting in-flight connections");
+        }
+    }
+    server_shutdown.cancel();
+    Ok(())
+}
+
+/// Demote expected handshake churn (health probes, client aborts, mTLS
+/// rejections) to debug; anything else is a real warning.
+#[cfg(feature = "openssl")]
+fn log_tls_noise(peer: std::net::SocketAddr, context: &str, err: impl std::fmt::Display) {
+    let msg = err.to_string().to_lowercase();
+    if [
+        "connection reset by peer",
+        "unexpected eof",
+        "protocol error",
+        "handshake failure",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
+    {
+        tracing::debug!(%peer, error = %err, "{context}");
+    } else {
+        warn!(%peer, error = %err, "{context}");
+    }
+}
+
+/// Same idea for errors while serving an established connection.
+#[cfg(feature = "openssl")]
+fn log_conn_noise(peer: std::net::SocketAddr, err: impl std::fmt::Display) {
+    let msg = err.to_string().to_lowercase();
+    if [
+        "connection reset by peer",
+        "broken pipe",
+        "connection was closed",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
+    {
+        tracing::debug!(%peer, error = %err, "connection closed");
+    } else {
+        warn!(%peer, error = %err, "error serving HTTPS connection");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +449,47 @@ mod tests {
             effective_served_model_names("backend-model", &served_names),
             served_names
         );
+    }
+
+    /// Drive the real `serve_http_tls` accept loop with on-disk certs and a
+    /// trivial router (no engine), fire an actual HTTPS request, and assert the
+    /// response comes back over TLS. Covers the handshake, hyper-over-axum, and
+    /// graceful shutdown.
+    #[cfg(feature = "openssl")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serves_https_through_the_tls_accept_loop() {
+        use axum::routing::get;
+        use tempfile::TempDir;
+
+        use crate::tls::{OpensslAcceptor, TlsAcceptor, test_support};
+
+        let dir = TempDir::new().unwrap();
+        let (certfile, keyfile) = test_support::self_signed(&dir);
+        let acceptor: Arc<dyn TlsAcceptor> =
+            OpensslAcceptor::new(&test_support::tls_config(certfile.clone(), keyfile)).unwrap();
+
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = CancellationToken::new();
+        let server = tokio::spawn(serve_http_tls(
+            listener,
+            app,
+            acceptor,
+            shutdown.child_token(),
+            shutdown.clone(),
+            CancellationToken::new(),
+        ));
+
+        let response = test_support::https_get(addr, &certfile, "/health").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        assert!(response.ends_with("ok"), "unexpected body: {response}");
+
+        shutdown.cancel();
+        server.await.unwrap().unwrap();
     }
 }
