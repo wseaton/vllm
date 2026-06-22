@@ -546,6 +546,55 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
 }
 
 #[test]
+fn frontend_args_json_enable_ssl_refresh_alone_does_not_enable_tls() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-address",
+        "ipc:///tmp/input.sock",
+        "--output-address",
+        "ipc:///tmp/output.sock",
+        "--args-json",
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","enable_ssl_refresh":true}"#,
+    ])
+    .unwrap();
+
+    let Command::Frontend(args) = cli.command else {
+        panic!("expected frontend args");
+    };
+    assert!(args.runtime.enable_ssl_refresh);
+    let config = args.into_config();
+    assert!(config.tls.is_none());
+}
+
+#[test]
+fn frontend_args_json_preserves_ssl_refresh_for_tls_config() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-address",
+        "ipc:///tmp/input.sock",
+        "--output-address",
+        "ipc:///tmp/output.sock",
+        "--args-json",
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","ssl_keyfile":"/tmp/server.key","ssl_certfile":"/tmp/server.crt","enable_ssl_refresh":true}"#,
+    ])
+    .unwrap();
+
+    let Command::Frontend(args) = cli.command else {
+        panic!("expected frontend args");
+    };
+    let tls = args.into_config().tls.expect("expected TLS config");
+    assert_eq!(tls.keyfile, "/tmp/server.key");
+    assert_eq!(tls.certfile, "/tmp/server.crt");
+    assert!(tls.enable_refresh);
+}
+
+#[test]
 fn serve_args_accept_none_reasoning_parser() {
     let cli = Cli::try_parse_from([
         "vllm-rs",
@@ -689,15 +738,16 @@ fn frontend_args_json_rejects_unsupported_fields() {
     ])
     .unwrap_err();
 
+    let actual = error.to_string().replace(": \n", ":\n");
     expect![[r#"
-        error: invalid value '{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant"}' for '--args-json <JSON>': 
+        error: invalid value '{"model_tag":"Qwen/Qwen3-0.6B","response_role":"assistant"}' for '--args-json <JSON>':
         The following arguments are not implemented in Rust frontend yet:
         - response_role
 
         Remove these arguments to continue.
 
         For more information, try '--help'.
-    "#]].assert_eq(&error.to_string());
+    "#]].assert_eq(&actual);
 }
 
 #[test]

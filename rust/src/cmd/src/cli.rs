@@ -431,8 +431,7 @@ impl SharedRuntimeArgs {
             || self.ssl_certfile.is_some()
             || self.ssl_ca_certs.is_some()
             || self.ssl_ciphers.is_some()
-            || self.ssl_cert_reqs != 0
-            || self.enable_ssl_refresh;
+            || self.ssl_cert_reqs != 0;
         intended.then(|| TlsConfig {
             keyfile: self.ssl_keyfile.clone().unwrap_or_default(),
             certfile: self.ssl_certfile.clone().unwrap_or_default(),

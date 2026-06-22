@@ -238,6 +238,28 @@ async fn http_test_server(
     tokio::task::JoinHandle<()>,
     MockEngineTask,
 ) {
+    let (app, engine_task) = http_test_app(engine_id, output_specs).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind http listener");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("http server");
+    });
+
+    let openai_client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_key("unused")
+            .with_api_base(format!("http://{addr}/v1")),
+    );
+
+    (openai_client, server_task, engine_task)
+}
+
+async fn http_test_app(
+    engine_id: impl Into<EngineId>,
+    output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
+) -> (axum::Router, MockEngineTask) {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = engine_id.into();
@@ -277,20 +299,7 @@ async fn http_test_server(
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
     let app = build_router(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind http listener");
-    let addr = listener.local_addr().expect("local addr");
-
-    let server_task = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("http server");
-    });
-
-    let openai_client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_key("unused")
-            .with_api_base(format!("http://{addr}/v1")),
-    );
-
-    (openai_client, server_task, engine_task)
+    (app, engine_task)
 }
 
 // ========================================================================================
@@ -308,6 +317,81 @@ async fn list_models_via_http_client() {
     assert_eq!(model_ids, vec!["test-model"]);
 
     server_task.abort();
+}
+
+#[cfg(feature = "openssl")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn tls_shutdown_drains_idle_keepalive_connection_on_app_router() {
+    use std::time::Duration;
+
+    use openssl::ssl::{SslConnector, SslMethod};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_util::sync::CancellationToken;
+
+    use crate::tls::{OpensslAcceptor, TlsAcceptor, test_support};
+
+    let (app, _engine_task) =
+        http_test_app(b"engine-http-tls-keepalive", default_stream_output_specs()).await;
+
+    let dir = TempDir::new().unwrap();
+    let (certfile, keyfile) = test_support::self_signed(&dir);
+    let acceptor: Arc<dyn TlsAcceptor> =
+        OpensslAcceptor::new(&test_support::tls_config(certfile.clone(), keyfile)).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = CancellationToken::new();
+    let server = tokio::spawn(crate::serve_http_tls(
+        listener,
+        app,
+        acceptor,
+        shutdown.child_token(),
+        shutdown.clone(),
+        CancellationToken::new(),
+    ));
+
+    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    connector.set_ca_file(&certfile).unwrap();
+    let ssl = connector.build().configure().unwrap().into_ssl("localhost").unwrap();
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut stream = tokio_openssl::SslStream::new(ssl, tcp).unwrap();
+    Pin::new(&mut stream).connect().await.unwrap();
+
+    stream
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("timed out waiting for HTTPS response")
+            .unwrap();
+        assert_ne!(n, 0, "HTTPS connection closed before response body");
+        response.extend_from_slice(&buf[..n]);
+        if String::from_utf8_lossy(&response).contains("\"test-model\"") {
+            break;
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected response: {response}"
+    );
+
+    shutdown.cancel();
+    // A real regression hangs indefinitely, so a generous deadline still catches
+    // it while tolerating slow/loaded CI.
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("TLS server did not drain idle app-router keep-alive connection")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

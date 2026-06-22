@@ -332,11 +332,13 @@ async fn serve_http_tls(
 
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::server::conn::auto::Builder;
+    use hyper_util::server::graceful::GracefulShutdown;
     use hyper_util::service::TowerToHyperService;
     use tokio_util::task::TaskTracker;
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     let conns = TaskTracker::new();
+    let graceful = GracefulShutdown::new();
 
     loop {
         let (sock, peer) = tokio::select! {
@@ -356,10 +358,16 @@ async fn serve_http_tls(
 
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let conn_shutdown = shutdown.clone();
         let force_shutdown = force_shutdown.clone();
+        let watcher = graceful.watcher();
         conns.spawn(async move {
-            let stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await
-            {
+            let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock));
+            let stream = match tokio::select! {
+                result = handshake => result,
+                _ = conn_shutdown.cancelled() => return,
+                _ = force_shutdown.cancelled() => return,
+            } {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(err)) => return log_tls_noise(peer, "TLS handshake error", &err),
                 Err(_) => return tracing::debug!(%peer, "TLS handshake timed out"),
@@ -368,6 +376,7 @@ async fn serve_http_tls(
             let service = TowerToHyperService::new(app);
             let builder = Builder::new(TokioExecutor::new());
             let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+            let conn = watcher.watch(conn);
             tokio::pin!(conn);
             let result = tokio::select! {
                 result = conn.as_mut() => result,
@@ -381,8 +390,12 @@ async fn serve_http_tls(
 
     // Stop accepting and let in-flight connections finish until the deadline.
     conns.close();
+    let graceful_shutdown = graceful.shutdown();
     tokio::select! {
-        _ = conns.wait() => {}
+        _ = async {
+            graceful_shutdown.await;
+            conns.wait().await;
+        } => {}
         _ = force_shutdown.cancelled() => {
             warn!("HTTPS graceful shutdown deadline elapsed; aborting in-flight connections");
         }

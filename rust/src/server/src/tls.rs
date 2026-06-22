@@ -1,6 +1,5 @@
 //! Inbound TLS termination: the backend-agnostic [`TlsAcceptor`] trait and its
-//! system-OpenSSL implementation. Compiled only in the `openssl` build; mirrors
-//! the Python frontend's `ssl_*` server arguments.
+//! system-OpenSSL implementation.
 
 use std::future::Future;
 use std::path::Path;
@@ -18,24 +17,19 @@ use tracing::{error, info, warn};
 
 use crate::config::TlsConfig;
 
-/// Blanket marker so we can name one trait object covering both IO halves
-/// (`dyn AsyncRead + AsyncWrite` isn't allowed: two non-auto traits).
 pub(crate) trait TlsIo: AsyncRead + AsyncWrite + Send {}
 impl<T: AsyncRead + AsyncWrite + Send> TlsIo for T {}
 
-/// A decrypted byte stream from a terminated TLS connection, type-erased so the
-/// serve loop and refresher don't care which crypto backend produced it.
+/// A decrypted byte stream from a terminated TLS connection,
+/// using dyn for the type erasure.
 pub(crate) type TlsStream = Pin<Box<dyn TlsIo>>;
 
-/// One inbound TLS backend: terminates connections and supports cert rotation.
-/// The accept loop in `lib.rs` and `spawn_refresher` drive this without knowing
-/// whether it's OpenSSL, rustls, or anything else.
+/// dyn Trait used to in the future support different TLS backends
 pub(crate) trait TlsAcceptor: Send + Sync + 'static {
     /// Run the server-side handshake on an accepted TCP connection.
     fn accept(&self, tcp: TcpStream) -> Pin<Box<dyn Future<Output = Result<TlsStream>> + Send>>;
 
-    /// Rebuild from the original config and hot-swap, so live connections keep
-    /// their old certs while new ones pick up the rotation.
+    /// Rebuild from the original config and hot-swap
     fn reload(&self) -> Result<()>;
 
     /// Key/cert/CA paths to watch for rotation.
@@ -57,7 +51,7 @@ fn build_acceptor(cfg: &TlsConfig) -> Result<SslAcceptor> {
             .set_ca_file(ca)
             .with_context(|| format!("failed to load ssl_ca_certs {ca}"))?;
     }
-    // Matches stdlib ssl.CERT_NONE / CERT_OPTIONAL / CERT_REQUIRED.
+    // mirror python's stdlib ssl.CERT_NONE / CERT_OPTIONAL / CERT_REQUIRED.
     let verify = match cfg.cert_reqs {
         0 => SslVerifyMode::NONE,
         1 => SslVerifyMode::PEER,
@@ -73,9 +67,6 @@ fn build_acceptor(cfg: &TlsConfig) -> Result<SslAcceptor> {
     Ok(builder.build())
 }
 
-/// OpenSSL-backed [`TlsAcceptor`]. The `ArcSwap` holds the live acceptor; the
-/// refresher swaps in a freshly built one on cert rotation, so connections
-/// mid-handshake or in-flight keep using the acceptor they started with.
 pub(crate) struct OpensslAcceptor {
     cfg: TlsConfig,
     acceptor: ArcSwap<SslAcceptor>,
@@ -92,8 +83,6 @@ impl OpensslAcceptor {
 
 impl TlsAcceptor for OpensslAcceptor {
     fn accept(&self, tcp: TcpStream) -> Pin<Box<dyn Future<Output = Result<TlsStream>> + Send>> {
-        // Snapshot the live acceptor so the handshake future doesn't borrow self
-        // across the await (and a mid-handshake rotation can't yank it).
         let acceptor = self.acceptor.load_full();
         Box::pin(async move {
             let ssl = Ssl::new(acceptor.context()).context("failed to create SSL session")?;
@@ -234,7 +223,7 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Issue a real HTTPS GET over OpenSSL, trusting `ca_path` and verifying the
+    /// Issue a HTTPS GET over OpenSSL, trusting `ca_path` and verifying the
     /// `localhost` SAN, and return the raw HTTP response text. Uses
     /// `Connection: close` so the read terminates when the server closes.
     pub(crate) async fn https_get(addr: SocketAddr, ca_path: &str, path: &str) -> String {
