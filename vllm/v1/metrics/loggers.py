@@ -1044,6 +1044,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if type == "cache_config":
             name = "vllm:cache_config_info"
             documentation = "Information of the LLMEngine CacheConfig"
+            try:
+                from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+                    compute_pd_config_hash,
+                )
+                metrics_info["pd_config_hash"] = compute_pd_config_hash(
+                    self.vllm_config
+                )
+            except Exception:
+                pass
         assert name is not None, f"Unknown metrics info type {type}"
 
         # Info type metrics are syntactic sugar for a gauge permanently set to 1
@@ -1058,6 +1067,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         for engine_index in self.engine_indexes:
             metrics_info = config_obj.metrics_info()
             metrics_info["engine"] = str(engine_index)
+            if type == "cache_config":
+                try:
+                    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+                        compute_pd_config_hash,
+                    )
+                    metrics_info["pd_config_hash"] = compute_pd_config_hash(
+                        self.vllm_config
+                    )
+                except Exception:
+                    pass
             info_gauge.labels(**metrics_info).set(1)
 
     def record(

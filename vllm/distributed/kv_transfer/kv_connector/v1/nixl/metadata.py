@@ -76,6 +76,32 @@ class NixlHandshakePayload(KVConnectorHandshakeMetadata):
     agent_metadata_bytes: bytes  # NixlAgentMetadata encoded
 
 
+def _nixl_base_factors(vllm_config: VllmConfig) -> dict:
+    """Canonical factor set for NIXL KV transfer compatibility.
+
+    Both compute_nixl_compatibility_hash and compute_pd_config_hash
+    build on this base, adding their own extras.  Keep the factor list
+    here; do not duplicate it.
+    """
+    from vllm import __version__ as vllm_version
+
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    is_hma_enabled = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+
+    return {
+        "vllm_version": vllm_version,
+        "nixl_connector_version": NIXL_CONNECTOR_VERSION,
+        "model": model_config.model,
+        "dtype": str(model_config.dtype),
+        "num_kv_heads": model_config.get_total_num_kv_heads(),
+        "head_size": model_config.get_head_size(),
+        "num_hidden_layers": model_config.get_total_num_hidden_layers(),
+        "cache_dtype": str(cache_config.cache_dtype),
+        "is_hma_enabled": is_hma_enabled,
+    }
+
+
 def compute_nixl_compatibility_hash(
     vllm_config: VllmConfig, attn_backend_name: str, cross_layers_blocks: bool
 ) -> str:
@@ -85,11 +111,13 @@ def compute_nixl_compatibility_hash(
     Hash only the factors that affect whether two NIXL instances can
     successfully transfer KV cache data.
 
-    Factors included:
+    Factors included (via _nixl_base_factors):
     - vLLM version and NIXL connector version
     - Model architecture (name, dtype, KV heads, layers)
-    - KV cache format (dtype, sliding window)
+    - KV cache format (dtype)
+    Plus runtime-detected factors:
     - Attention backend
+    - Cross-layer block grouping
 
     Note: Factors like tensor_parallel_size, block_size, and kv_cache_layout
     are validated at runtime in _validate_remote_agent_handshake and are not
@@ -101,29 +129,11 @@ def compute_nixl_compatibility_hash(
     Returns:
         SHA-256 hex digest
     """
-    from vllm import __version__ as vllm_version
     from vllm.config.utils import hash_factors
 
-    model_config = vllm_config.model_config
-    cache_config = vllm_config.cache_config
-    is_hma_enabled = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
-
-    factors = {
-        # Version compatibility
-        "vllm_version": vllm_version,
-        "nixl_connector_version": NIXL_CONNECTOR_VERSION,
-        # Model architecture - affects KV cache shape
-        "model": model_config.model,
-        "dtype": str(model_config.dtype),
-        "num_kv_heads": model_config.get_total_num_kv_heads(),
-        "head_size": model_config.get_head_size(),
-        "num_hidden_layers": model_config.get_total_num_hidden_layers(),
-        # Attention backend and KV cache dtype affect memory layout
-        "attn_backend_name": attn_backend_name,
-        "cache_dtype": str(cache_config.cache_dtype),
-        "cross_layers_blocks": cross_layers_blocks,
-        "is_hma_enabled": is_hma_enabled,
-    }
+    factors = _nixl_base_factors(vllm_config)
+    factors["attn_backend_name"] = attn_backend_name
+    factors["cross_layers_blocks"] = cross_layers_blocks
 
     compat_hash = hash_factors(factors)
     logger.debug(
@@ -137,6 +147,34 @@ def compute_nixl_compatibility_hash(
         attn_backend_name,
     )
     return compat_hash
+
+
+def compute_pd_config_hash(vllm_config: VllmConfig) -> str:
+    """Compute a routing-level compatibility hash for P/D disaggregation.
+
+    Builds on _nixl_base_factors and adds deployment-level factors
+    (block_size, tensor_parallel_size) that are validated at runtime in
+    _validate_remote_agent_handshake.  The router compares this hash
+    across prefill and decode endpoints to avoid pairing pods whose NIXL
+    handshake would fail.
+    """
+    from vllm.config.utils import hash_factors
+
+    factors = _nixl_base_factors(vllm_config)
+    factors["block_size"] = vllm_config.cache_config.block_size
+    factors["tensor_parallel_size"] = (
+        vllm_config.parallel_config.tensor_parallel_size
+    )
+
+    pd_hash = hash_factors(factors)
+    logger.debug(
+        "P/D config hash: %s (model=%s, block_size=%d, tp_size=%d)",
+        pd_hash,
+        factors["model"],
+        factors["block_size"],
+        factors["tensor_parallel_size"],
+    )
+    return pd_hash
 
 
 @dataclass
