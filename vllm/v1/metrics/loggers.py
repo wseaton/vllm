@@ -4,6 +4,7 @@
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable
 
 from prometheus_client import Counter, Gauge, Histogram
@@ -428,6 +429,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         labelnames = ["model_name", "engine"]
         model_name = vllm_config.model_config.served_model_name
+        self.model_name = model_name
         max_model_len = vllm_config.model_config.max_model_len
 
         self.per_engine_labelvalues: dict[int, list[object]] = {
@@ -1030,6 +1032,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.labelname_running_lora_adapters,
                 ],
             )
+            self.gauge_lora_adapter_loaded = self._gauge_cls(
+                name="vllm:lora_adapter_loaded",
+                documentation=(
+                    "Per-adapter residency gauge. Value 1 while "
+                    "the adapter is resident; level is gpu or cpu."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=[
+                    "model_name", "engine",
+                    "adapter_name", "level", "pinned",
+                ],
+            )
+            self._prev_adapter_label_sets: set[
+                tuple[str, str, str, str, str]
+            ] = set()
+            self._adapter_lru: dict[int, OrderedDict[str, bool]] = {}
 
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
         metrics_info = config_obj.metrics_info()
@@ -1135,6 +1153,49 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.labelname_max_lora: self.max_lora,
                 }
                 self.gauge_lora_info.labels(**lora_info_labels).set_to_current_time()
+
+                model_name = self.model_name
+                engine_label = str(engine_idx)
+
+                lru = self._adapter_lru.get(engine_idx)
+                if lru is None:
+                    lru = OrderedDict()
+                    self._adapter_lru[engine_idx] = lru
+                for name in scheduler_stats.running_lora_adapters:
+                    lru.pop(name, None)
+                    lru[name] = True
+                while len(lru) > self.max_lora:
+                    lru.popitem(last=False)
+
+                new_label_sets: set[
+                    tuple[str, str, str, str, str]
+                ] = set()
+                for name in lru:
+                    new_label_sets.add(
+                        (model_name, engine_label, name, "gpu", "false")
+                    )
+                for name in scheduler_stats.waiting_lora_adapters:
+                    if name not in lru:
+                        new_label_sets.add(
+                            (model_name, engine_label, name, "cpu", "false")
+                        )
+                for labels in self._prev_adapter_label_sets - new_label_sets:
+                    self.gauge_lora_adapter_loaded.labels(
+                        model_name=labels[0],
+                        engine=labels[1],
+                        adapter_name=labels[2],
+                        level=labels[3],
+                        pinned=labels[4],
+                    ).set(0)
+                for labels in new_label_sets:
+                    self.gauge_lora_adapter_loaded.labels(
+                        model_name=labels[0],
+                        engine=labels[1],
+                        adapter_name=labels[2],
+                        level=labels[3],
+                        pinned=labels[4],
+                    ).set(1)
+                self._prev_adapter_label_sets = new_label_sets
 
         if mm_cache_stats is not None:
             self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)

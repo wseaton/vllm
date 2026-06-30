@@ -271,35 +271,17 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             self.add_adapter(lora)
 
     def add_adapter(self, lora_request: LoRARequest) -> bool:
-        # Note that this method is not thread-safe. It may be invoked multiple
-        # times for the same adapter when using multiple API servers.
-        # This is ok because it's currently only called from
-        # the single-threaded core engine loop.
-
         if (
             lora_request.lora_int_id not in self.list_adapters()
             or lora_request.load_inplace
         ):
-            # Load the new adapter first to ensure it is actually valid, before
-            # evicting any existing adapters.
-            # This may cause the # of loaded lora adapters to very temporarily
-            # exceed `--max-cpu-loras`.
             lora = self._load_adapter(lora_request)
-
-            # Remove the existing adapter if it exists
-            # Use case for LoRA inplace
             self._adapter_manager.remove_adapter(lora.id)
-
-            # Loading succeeded, now check if we will exceed cache capacity and
-            # evict if the oldest adapter if so
             if len(self._adapter_manager) + 1 > self._adapter_manager.capacity:
                 assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
                 self._adapter_manager.remove_oldest_adapter()
-            # Then add the new adapter to the cache
             loaded = self._adapter_manager.add_adapter(lora)
         else:
-            # If the lora is already loaded, just touch it to
-            # update its position in the caches
             loaded = (
                 self._adapter_manager.get_adapter(lora_request.lora_int_id) is not None
             )
