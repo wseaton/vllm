@@ -4,6 +4,7 @@
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable
 
 from prometheus_client import Counter, Gauge, Histogram
@@ -1046,6 +1047,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self._prev_adapter_label_sets: set[
                 tuple[str, str, str, str, str]
             ] = set()
+            self._adapter_lru: dict[int, OrderedDict[str, bool]] = {}
 
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
         metrics_info = config_obj.metrics_info()
@@ -1154,15 +1156,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
                 model_name = self.model_name
                 engine_label = str(engine_idx)
+
+                lru = self._adapter_lru.get(engine_idx)
+                if lru is None:
+                    lru = OrderedDict()
+                    self._adapter_lru[engine_idx] = lru
+                for name in scheduler_stats.running_lora_adapters:
+                    lru.pop(name, None)
+                    lru[name] = True
+                while len(lru) > self.max_lora:
+                    lru.popitem(last=False)
+
                 new_label_sets: set[
                     tuple[str, str, str, str, str]
                 ] = set()
-                for name in scheduler_stats.running_lora_adapters:
+                for name in lru:
                     new_label_sets.add(
                         (model_name, engine_label, name, "gpu", "false")
                     )
                 for name in scheduler_stats.waiting_lora_adapters:
-                    if name not in scheduler_stats.running_lora_adapters:
+                    if name not in lru:
                         new_label_sets.add(
                             (model_name, engine_label, name, "cpu", "false")
                         )
