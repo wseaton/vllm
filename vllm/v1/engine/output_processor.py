@@ -424,6 +424,8 @@ class OutputProcessor:
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        max_loras: int = 0,
+        max_cpu_loras: int = 0,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -431,7 +433,11 @@ class OutputProcessor:
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
-        self.lora_states = LoRARequestStates(log_stats)
+        self.lora_states = LoRARequestStates(
+            log_stats,
+            max_gpu_loras=max_loras,
+            max_cpu_loras=max_cpu_loras,
+        )
         self.tracing_enabled = tracing_enabled
 
     def get_num_unfinished_requests(self):

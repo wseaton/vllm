@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -192,6 +192,8 @@ class SchedulerStats:
 
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
     running_lora_adapters: dict[str, int] = field(default_factory=dict)
+
+    loaded_adapters: list[tuple[str, str, bool]] = field(default_factory=list)
 
     cudagraph_stats: CUDAGraphStat | None = None
 
@@ -507,9 +509,32 @@ class LoRAStats:
 class LoRARequestStates:
     """A per-LoRA count of running and waiting requests."""
 
-    def __init__(self, log_stats: bool = False):
+    def __init__(
+        self,
+        log_stats: bool = False,
+        max_gpu_loras: int = 0,
+        max_cpu_loras: int = 0,
+    ):
         self.log_stats = log_stats
         self.requests: defaultdict[str, LoRAStats] = defaultdict(LoRAStats)
+        self._max_gpu = max_gpu_loras
+        self._max_cpu = max_cpu_loras
+        self._gpu_adapters: OrderedDict[str, None] = OrderedDict()
+        self._cpu_adapters: OrderedDict[str, None] = OrderedDict()
+
+    def _touch_adapter(self, lora_name: str) -> None:
+        if not self._max_gpu:
+            return
+        if lora_name in self._gpu_adapters:
+            self._gpu_adapters.move_to_end(lora_name)
+            return
+        self._cpu_adapters.pop(lora_name, None)
+        while len(self._gpu_adapters) >= self._max_gpu:
+            evicted, _ = self._gpu_adapters.popitem(last=False)
+            self._cpu_adapters[evicted] = None
+            while self._max_cpu and len(self._cpu_adapters) > self._max_cpu:
+                self._cpu_adapters.popitem(last=False)
+        self._gpu_adapters[lora_name] = None
 
     def _request_update(
         self, req_id: str, lora_name: str | None, waiting: bool, running: bool
@@ -521,6 +546,9 @@ class LoRARequestStates:
         lora_stats.update(req_id, waiting, running)
         if lora_stats.empty:
             del self.requests[lora_name]
+
+        if running:
+            self._touch_adapter(lora_name)
 
     def request_waiting(self, req_id: str, lora_name: str | None):
         self._request_update(req_id, lora_name, waiting=True, running=False)
@@ -537,3 +565,7 @@ class LoRARequestStates:
         for lora_name, stats in self.requests.items():
             scheduler_stats.waiting_lora_adapters[lora_name] = len(stats.waiting)
             scheduler_stats.running_lora_adapters[lora_name] = len(stats.running)
+        for name in self._gpu_adapters:
+            scheduler_stats.loaded_adapters.append((name, "gpu", False))
+        for name in self._cpu_adapters:
+            scheduler_stats.loaded_adapters.append((name, "cpu", False))

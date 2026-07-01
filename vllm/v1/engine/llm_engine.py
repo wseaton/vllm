@@ -93,11 +93,14 @@ class LLMEngine:
         self.input_processor = InputProcessor(self.vllm_config, renderer)
 
         # Converts EngineCoreOutputs --> RequestOutput.
+        lora_config = self.vllm_config.lora_config
         self.output_processor = OutputProcessor(
             renderer.tokenizer,
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            max_loras=lora_config.max_loras if lora_config else 0,
+            max_cpu_loras=lora_config.max_cpu_loras if lora_config else 0,
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
