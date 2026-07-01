@@ -1010,6 +1010,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # TODO: This metric might be incorrect in case of using multiple
         # api_server counts which uses prometheus mp.
         self.gauge_lora_info: Gauge | None = None
+        self.gauge_lora_adapter_loaded: Gauge | None = None
+        self.gauge_num_gpu_loaded: Gauge | None = None
+        self.gauge_num_cpu_loaded: Gauge | None = None
+        self._prev_adapter_labels: set[tuple[str, str, str]] = set()
         if vllm_config.lora_config is not None:
             if len(self.engine_indexes) > 1:
                 logger.warning(
@@ -1029,6 +1033,34 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.labelname_waiting_lora_adapters,
                     self.labelname_running_lora_adapters,
                 ],
+            )
+            self.gauge_lora_adapter_loaded = self._gauge_cls(
+                name="vllm:lora_adapter_loaded",
+                documentation=(
+                    "Per-adapter residency state. Value is 1 for each "
+                    "loaded adapter."
+                ),
+                multiprocess_mode="max",
+                labelnames=[
+                    "adapter_name",
+                    "level",
+                    "pinned",
+                ],
+            )
+            self.gauge_num_gpu_loaded = self._gauge_cls(
+                name="vllm:num_gpu_loaded_lora_adapters",
+                documentation=(
+                    "Number of LoRA adapters currently loaded on GPU."
+                ),
+                multiprocess_mode="max",
+            )
+            self.gauge_num_cpu_loaded = self._gauge_cls(
+                name="vllm:num_cpu_loaded_lora_adapters",
+                documentation=(
+                    "Number of LoRA adapters currently cached in CPU "
+                    "memory."
+                ),
+                multiprocess_mode="max",
             )
 
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
@@ -1135,6 +1167,31 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.labelname_max_lora: self.max_lora,
                 }
                 self.gauge_lora_info.labels(**lora_info_labels).set_to_current_time()
+
+            if self.gauge_lora_adapter_loaded is not None:
+                current_labels: set[tuple[str, str, str]] = set()
+                gpu_count = 0
+                cpu_count = 0
+                for name, level, pinned in scheduler_stats.loaded_adapters:
+                    pinned_str = str(pinned).lower()
+                    label = (name, level, pinned_str)
+                    current_labels.add(label)
+                    self.gauge_lora_adapter_loaded.labels(
+                        adapter_name=name,
+                        level=level,
+                        pinned=pinned_str,
+                    ).set(1)
+                    if level == "gpu":
+                        gpu_count += 1
+                    else:
+                        cpu_count += 1
+                for stale in self._prev_adapter_labels - current_labels:
+                    self.gauge_lora_adapter_loaded.remove(*stale)
+                self._prev_adapter_labels = current_labels
+                assert self.gauge_num_gpu_loaded is not None
+                assert self.gauge_num_cpu_loaded is not None
+                self.gauge_num_gpu_loaded.set(gpu_count)
+                self.gauge_num_cpu_loaded.set(cpu_count)
 
         if mm_cache_stats is not None:
             self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)
