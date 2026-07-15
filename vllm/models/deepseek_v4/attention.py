@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -21,11 +22,18 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    RADIX_TOPK_WORKSPACE_SIZE,
+    SparseAttnIndexer,
+    kv_cache_as_quant_view,
+)
 from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -770,6 +778,167 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
         ]
 
+        # ---- Decode fast-path: bypass SparseAttnIndexer custom op ----
+        # Pre-allocate topk workspace and pre-compute which topk variant
+        # to use (known at init time on CUDA SM90+). This eliminates
+        # ~16-18us of host-side dispatch overhead between the paged MQA
+        # logits kernel and the topk kernel for the common decode case.
+        # Ported from SGLang's pattern of calling paged_mqa_logits and
+        # topk sequentially in the same function scope without a custom
+        # op wrapper. See code_port_plan_review_V3.txt for details.
+        self._topk_workspace: torch.Tensor | None = None
+
+        # Cooperative topk: additional static conditions (runtime checks
+        # for num_rows <= 32 and TMA alignment are done in the hot path).
+        self._use_cooperative_topk: bool = (
+            current_platform.is_cuda()
+            and self.topk_tokens in (512, 1024, 2048)
+            and current_platform.has_device_capability(90)
+            and not current_platform.is_device_capability_family(120)
+        )
+        self._use_persistent_topk: bool = (
+            current_platform.is_cuda()
+            and self.topk_tokens in (512, 1024, 2048)
+        )
+
+        # Whether the decode fast-path can be used at all (static check).
+        # Environment variable override: set
+        # VLLM_DISABLE_INDEXER_DECODE_FASTPATH=1
+        # to disable the fast-path and fall back to the SparseAttnIndexer
+        # custom op.
+        _env_disabled = os.environ.get(
+            "VLLM_DISABLE_INDEXER_DECODE_FASTPATH", "0"
+        ) == "1"
+        self._can_use_fast_path: bool = (
+            not _env_disabled
+            and not self.use_fp4_kv
+            and current_platform.is_cuda()
+            and current_platform.has_device_capability(90)
+            and self.indexer_op.dcp_world_size <= 1
+        )
+        if _env_disabled:
+            logger.info_once(
+                "Indexer decode fast-path is DISABLED (env override)"
+            )
+        elif self._can_use_fast_path:
+            logger.info_once(
+                "Indexer decode fast-path is ENABLED"
+            )
+
+    def _inline_decode_logits_topk(
+        self,
+        q_quant: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_meta,
+    ) -> None:
+        """Fast-path: compute paged MQA logits + topk for decode.
+
+        Bypasses the SparseAttnIndexer custom op wrapper to eliminate
+        ~16-18us of host-side dispatch overhead between the logits
+        kernel and the topk kernel. Both kernels launch on the current
+        CUDA stream with minimal Python between them.
+
+        Writes LOCAL LOGICAL INDICES (not physical slot IDs) into
+        self.topk_indices_buffer. The downstream
+        compute_global_topk_indices_and_lens in forward_mqa translates
+        these to physical slot IDs using the MLA's block table.
+
+        Args:
+            q_quant: [num_tokens, n_heads, head_dim] FP8_E4M3
+            weights: [num_tokens, n_heads] FP32 (fused q_scale * weight)
+            indexer_meta: DeepseekV32IndexerMetadata for this layer.
+        """
+        decode_metadata = indexer_meta.decode
+
+        # --- Prepare KV cache view ---
+        kv_cache = self.k_cache.kv_cache
+        kv_cache = kv_cache_as_quant_view(
+            kv_cache, self.head_dim, False  # FP8 (FP4 excluded by caller)
+        )
+
+        # --- Prepare Q tensor and batch dimensions ---
+        num_decode_tokens = indexer_meta.num_decode_tokens
+        decode_lens = decode_metadata.decode_lens
+
+        if decode_metadata.requires_padding:
+            padded_q = pack_seq_triton(
+                q_quant[:num_decode_tokens], decode_lens
+            )
+        else:
+            padded_q = q_quant[:num_decode_tokens].reshape(
+                decode_lens.shape[0], -1, *q_quant.shape[1:]
+            )
+
+        batch_size = padded_q.shape[0]
+        next_n = padded_q.shape[1]
+        num_padded_tokens = batch_size * next_n
+        seq_lens = decode_metadata.seq_lens[:batch_size]
+
+        # --- Clear topk buffer (sentinel: -1 = invalid entry) ---
+        self.topk_indices_buffer[:num_padded_tokens] = -1
+
+        # --- Compute paged MQA logits ---
+        logits = fp8_fp4_paged_mqa_logits(
+            (padded_q, None),  # (q_fp8, q_scale=None for FP8 path)
+            kv_cache,
+            weights[:num_padded_tokens],
+            seq_lens,
+            decode_metadata.block_table,
+            decode_metadata.schedule_metadata,
+            max_model_len=self.max_model_len,
+            clean_logits=False,
+        )
+
+        # --- TopK selection ---
+        topk_indices = self.topk_indices_buffer[
+            :num_padded_tokens, :self.topk_tokens
+        ]
+        topk_tokens = self.topk_tokens
+        num_rows = logits.shape[0]
+
+        # Lazy workspace allocation (once, fixed address for CUDA graphs).
+        if self._topk_workspace is None:
+            self._topk_workspace = torch.empty(
+                RADIX_TOPK_WORKSPACE_SIZE,
+                dtype=torch.uint8,
+                device=logits.device,
+            )
+        topk_workspace = self._topk_workspace
+
+        # cooperative_topk: additional runtime checks (batch size,
+        # TMA alignment).
+        if (self._use_cooperative_topk
+                and num_rows <= 32
+                and logits.stride(0) % 4 == 0):
+            torch.ops._C.cooperative_topk(
+                logits, seq_lens, topk_indices, topk_workspace,
+                topk_tokens, indexer_meta.max_seq_len,
+            )
+        elif self._use_persistent_topk:
+            torch.ops._C.persistent_topk(
+                logits, seq_lens, topk_indices, topk_workspace,
+                topk_tokens, logits.shape[1],
+            )
+        else:
+            # Fallback for topk_tokens not in {512, 1024, 2048}.
+            from vllm import _custom_ops as _ops
+            _ops.top_k_per_row_decode(
+                logits, next_n, seq_lens, topk_indices,
+                num_rows, logits.stride(0), logits.stride(1), topk_tokens,
+            )
+
+        # --- Unpack if padding was used ---
+        if decode_metadata.requires_padding:
+            topk_indices_unpacked = unpack_seq_triton(
+                topk_indices.reshape(
+                    batch_size, -1, topk_indices.shape[-1]),
+                decode_lens,
+            )
+            self.topk_indices_buffer[
+                : topk_indices_unpacked.shape[0],
+                : topk_indices_unpacked.shape[-1],
+            ] = topk_indices_unpacked
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -804,4 +973,21 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
+
+        # Fast-path for pure decode: bypass SparseAttnIndexer custom op
+        # to eliminate ~16-18us of host-side dispatch overhead between
+        # the paged MQA logits kernel and the topk kernel.
+        if self._can_use_fast_path:
+            forward_context = get_forward_context()
+            attn_metadata = forward_context.attn_metadata
+            if isinstance(attn_metadata, dict):
+                indexer_meta = attn_metadata.get(self.k_cache.prefix)
+                if (indexer_meta is not None
+                        and indexer_meta.num_prefills == 0
+                        and indexer_meta.decode is not None):
+                    self._inline_decode_logits_topk(
+                        q_quant, weights, indexer_meta)
+                    return self.topk_indices_buffer
+
+        # Fallback: prefill, mixed, FP4, DCP, or unsupported platform
         return self.indexer_op(hidden_states, q_quant, k, weights)
