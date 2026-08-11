@@ -6,6 +6,7 @@ import torch
 
 from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.kernels.fused_a_gemm import is_fused_a_gemm_eligible
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
@@ -88,6 +89,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
 
+        # Check Q-B eligibility for fused_a_gemm JIT kernel
+        self._use_fused_q_b = (
+            self.q_lora_rank is not None
+            and self.q_b_proj is not None
+            and hasattr(self.q_b_proj, "weight")
+            and is_fused_a_gemm_eligible(self.q_b_proj.weight)
+        )
+
         # Whether to skip top-k token selection computation in this layer.
         # When True, the indexer will not be called, and the layer will reuse
         # the topk_tokens buffer written by a previous layer in the same pass.
@@ -166,7 +175,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        q = q_proj_layer(q_proj_input)[0]
+        if self._use_fused_q_b:
+            q = torch.ops.vllm.fused_a_gemm_jit(
+                q_proj_input, self.q_b_proj.weight)
+        else:
+            q = q_proj_layer(q_proj_input)[0]
         heads = self.num_heads
         if self.dcp_q_replicate:
             heads *= q_proj_layer.group_size

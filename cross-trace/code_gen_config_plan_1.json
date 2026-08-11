@@ -1,0 +1,23 @@
+{
+    "cross_trace_config": "/sandbox/vllm/cross-trace/cross_trace_config.json",
+    "improvement_id": 1,
+    "source_code_dir": "/sandbox/vllm",
+    "output_dir": "/sandbox/vllm/codegen-out",
+    "num_code_port_plan_iterations": 3,
+    "num_test_plan_iterations": 3,
+    "num_code_gen_iterations": 3,
+    "num_runtime_iterations": 10,
+    "gpu_wait_timeout_minutes": 30,
+    "use_smaller_model_for_runtime": false,
+    "disable_new_feature_for_runtime": false,
+    "additional_benchmark_configs": [],
+    "runtime_backend": "delegated",
+    "disallowed_modules": ["sglang*"],
+    "code_port_plan_skip_review": false,
+    "test_plan_skip_review": false,
+    "code_gen_skip_review": false,
+    "generate_pr_commands": false,
+    "pr_base_branch": "main",
+    "pr_remote": "origin",
+    "thinking-mode": "deep"
+}
