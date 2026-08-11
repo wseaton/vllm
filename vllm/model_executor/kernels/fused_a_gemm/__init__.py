@@ -6,7 +6,7 @@ Supports generalized shapes via per-(hd_in, hd_out) JIT compilation.
 The kernel is optimized for num_tokens in [1, 16] with BF16 I/O and
 FP32 accumulation. Falls back to F.linear for num_tokens > 16.
 
-Kill-switch: set VLLM_DISABLE_FUSED_A_GEMM_JIT=1 to disable.
+Kill-switch: set VLLM_GLM_TOGGLE=1 to disable.
 """
 
 import functools
@@ -23,7 +23,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = logging.getLogger(__name__)
 
 _FUSED_A_GEMM_JIT_DISABLED = bool(
-    int(os.getenv("VLLM_DISABLE_FUSED_A_GEMM_JIT", "0"))
+    int(os.getenv("VLLM_GLM_TOGGLE", "0"))
 )
 
 if _FUSED_A_GEMM_JIT_DISABLED:

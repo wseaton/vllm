@@ -6,7 +6,10 @@ import torch
 
 from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
-from vllm.model_executor.kernels.fused_a_gemm import is_fused_a_gemm_eligible
+from vllm.model_executor.kernels.fused_a_gemm import (
+    _load_jit_module,
+    is_fused_a_gemm_eligible,
+)
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
@@ -96,6 +99,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             and hasattr(self.q_b_proj, "weight")
             and is_fused_a_gemm_eligible(self.q_b_proj.weight)
         )
+        if self._use_fused_q_b:
+            _load_jit_module(
+                self.q_b_proj.weight.shape[1],
+                self.q_b_proj.weight.shape[0],
+            )
 
         # Whether to skip top-k token selection computation in this layer.
         # When True, the indexer will not be called, and the layer will reuse
