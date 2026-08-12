@@ -921,19 +921,49 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
             prefix=prefix,
         )
 
-        # Check if the DeepSeek V3 fused A GEMM kernel can be used.
-        # This kernel supports PDL and is optimized for low batch size.
-        self._use_min_latency_gemm = (
+        _FUSED_A_GEMM_SUPPORTED_SHAPES = {
+            (2112, 7168),
+            (2624, 6144),
+        }
+
+        is_original_dsv3_shape = (
             hasattr(self, "weight")
             and self.weight.dtype == torch.bfloat16
             and self.weight.shape[0] == 2112
             and self.weight.shape[1] == 7168
-            and current_platform.is_cuda()
-            and (
-                current_platform.is_device_capability(90)
-                or current_platform.is_device_capability_family(100)
-            )
         )
+        is_general_shape = (
+            hasattr(self, "weight")
+            and self.weight.dtype == torch.bfloat16
+            and (self.weight.shape[0], self.weight.shape[1])
+            in _FUSED_A_GEMM_SUPPORTED_SHAPES
+            and not is_original_dsv3_shape
+            and not envs.VLLM_GLM_TOGGLE
+        )
+
+        self._use_min_latency_gemm = (
+            (is_original_dsv3_shape or is_general_shape)
+            and current_platform.is_cuda()
+            and current_platform.has_device_capability(90)
+        )
+
+        if is_general_shape and self._use_min_latency_gemm:
+            logger.info(
+                "Generalized fused_a_gemm for shape %s is ENABLED",
+                (self.weight.shape[0], self.weight.shape[1]),
+            )
+        elif (
+            hasattr(self, "weight")
+            and (self.weight.shape[0], self.weight.shape[1])
+            in _FUSED_A_GEMM_SUPPORTED_SHAPES
+            and not is_original_dsv3_shape
+            and envs.VLLM_GLM_TOGGLE
+        ):
+            logger.info(
+                "Generalized fused_a_gemm for shape %s "
+                "is DISABLED (env override)",
+                (self.weight.shape[0], self.weight.shape[1]),
+            )
 
     def forward(
         self,
