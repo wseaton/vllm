@@ -4,10 +4,15 @@ from dataclasses import dataclass
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -102,6 +107,39 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.topk_tokens = self.indexer.topk_tokens
             self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
+        _FUSED_A_GEMM_Q_B_SHAPES = {
+            (4096, 2048),
+        }
+
+        self._use_min_latency_q_b = False
+        if (
+            self.q_b_proj is not None
+            and hasattr(self.q_b_proj, "weight")
+            and self.q_b_proj.weight.dtype == torch.bfloat16
+            and (self.q_b_proj.weight.shape[0], self.q_b_proj.weight.shape[1])
+            in _FUSED_A_GEMM_Q_B_SHAPES
+            and not envs.VLLM_GLM_TOGGLE
+            and current_platform.is_cuda()
+            and current_platform.has_device_capability(90)
+        ):
+            self._use_min_latency_q_b = True
+            logger.info(
+                "Generalized fused_a_gemm for Q-B shape %s is ENABLED",
+                (self.q_b_proj.weight.shape[0], self.q_b_proj.weight.shape[1]),
+            )
+        elif (
+            self.q_b_proj is not None
+            and hasattr(self.q_b_proj, "weight")
+            and (self.q_b_proj.weight.shape[0], self.q_b_proj.weight.shape[1])
+            in _FUSED_A_GEMM_Q_B_SHAPES
+            and envs.VLLM_GLM_TOGGLE
+        ):
+            logger.info(
+                "Generalized fused_a_gemm for Q-B shape %s "
+                "is DISABLED (env override)",
+                (self.q_b_proj.weight.shape[0], self.q_b_proj.weight.shape[1]),
+            )
+
         self.mla_attn = MLAAttention(
             num_heads=self.num_heads,
             scale=scale,
@@ -166,7 +204,12 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        q = q_proj_layer(q_proj_input)[0]
+        if self._use_min_latency_q_b and q_proj_layer is self.q_b_proj:
+            q = torch.ops.vllm.min_latency_fused_qkv_a_proj(
+                q_proj_input, q_proj_layer.weight
+            )
+        else:
+            q = q_proj_layer(q_proj_input)[0]
         heads = self.num_heads
         if self.dcp_q_replicate:
             heads *= q_proj_layer.group_size

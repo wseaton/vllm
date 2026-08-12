@@ -3118,15 +3118,17 @@ def dsv3_fused_a_gemm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
 ) -> None:
-    """DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).
+    """Fused A GEMM kernel (SM 9.0+, bf16 only, 1-16 tokens).
 
     Computes output = mat_a @ mat_b.T where:
-      mat_a: [num_tokens, 7168] row-major bf16 (hidden states)
-      mat_b: [7168, 2112] column-major bf16 (weight transposed)
-      output: [num_tokens, 2112] row-major bf16
+      mat_a: [num_tokens, hd_in] row-major bf16
+      mat_b: [hd_in, hd_out] column-major bf16 (weight transposed)
+      output: [num_tokens, hd_out] row-major bf16
 
-    Optimized for the DeepSeek V2/V3 QKV A-projection at small batch sizes.
-    Requires SM 9.0+ (Hopper).
+    Supported (hd_in, hd_out) shapes:
+      (7168, 2112) — DeepSeek-V3 QKV-A
+      (6144, 2624) — GLM-5.2 QKV-A
+      (2048, 4096) — GLM-5.2 Q-B (TP=4)
     """
     torch.ops._C.dsv3_fused_a_gemm(output, mat_a, mat_b)
 

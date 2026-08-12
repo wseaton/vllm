@@ -391,7 +391,7 @@ struct MmaComputer {
   static constexpr int n_iter_cnt =
       (tile_n + 7) /
       8;  // Possible to have non-1 n_iter_cnt for ab_swap m16 case.
-  static_assert(m_iter_cnt == 1);
+  static_assert(m_iter_cnt == 1 || m_iter_cnt == 2);
   static_assert(n_iter_cnt == 1 || n_iter_cnt == 2);
 
   __device__ MmaComputer(bf16_t* gmem_c_local_, bf16_t* smem_a_,
@@ -417,12 +417,15 @@ struct MmaComputer {
   __device__ void prepare() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   #pragma unroll
-    for (int i = 0; i < k_phase_cnt; i++) {
-      int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
-      int m_idx = linear_idx % tile_m;
-      int k_idx = linear_idx / tile_m + warp_k_offset_in_tile_k;
-      k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
-      a_smem_offsets[0][i] = m_idx * tile_k + k_idx;
+    for (int m = 0; m < m_iter_cnt; m++) {
+  #pragma unroll
+      for (int i = 0; i < k_phase_cnt; i++) {
+        int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
+        int m_idx = linear_idx % 16 + m * 16;
+        int k_idx = linear_idx / 16 + warp_k_offset_in_tile_k;
+        k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
+        a_smem_offsets[m][i] = m_idx * tile_k + k_idx;
+      }
     }
   #pragma unroll
     for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++) {
@@ -446,11 +449,14 @@ struct MmaComputer {
       wait_barrier(smem_barrier + 0 + stage_idx * 2, phase_bit);
 
   #pragma unroll
-      for (int i = 0; i < k_phase_cnt; i++) {
-        int smem_offset = a_smem_offsets[0][i];
-        bf16_t* smem_ptr_this_iter =
-            smem_a + stage_idx * tile_m * tile_k + smem_offset;
-        ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[0][i]));
+      for (int m = 0; m < m_iter_cnt; m++) {
+  #pragma unroll
+        for (int i = 0; i < k_phase_cnt; i++) {
+          int smem_offset = a_smem_offsets[m][i];
+          bf16_t* smem_ptr_this_iter =
+              smem_a + stage_idx * tile_m * tile_k + smem_offset;
+          ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[m][i]));
+        }
       }
 
   #pragma unroll
@@ -469,9 +475,12 @@ struct MmaComputer {
       for (int k_iter_idx = 0; k_iter_idx < k_phase_cnt; k_iter_idx++) {
   #pragma unroll
         for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++) {
-          hmma_16_8_16_f32acc_bf16ab(
-              acc_reg[0][n_iter_idx], a_reg[0][k_iter_idx],
-              b_reg[n_iter_idx][k_iter_idx], acc_reg[0][n_iter_idx]);
+  #pragma unroll
+          for (int m = 0; m < m_iter_cnt; m++) {
+            hmma_16_8_16_f32acc_bf16ab(
+                acc_reg[m][n_iter_idx], a_reg[m][k_iter_idx],
+                b_reg[n_iter_idx][k_iter_idx], acc_reg[m][n_iter_idx]);
+          }
         }
       }
       ::arrive_barrier(smem_barrier + 1 + stage_idx * 2);
@@ -485,15 +494,14 @@ struct MmaComputer {
   __device__ void epi() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("bar.sync %0, %1;" : : "r"(1), "r"(thread_cnt));
-    // reorganize the acc_reg
-    constexpr int thread_m = 2;
+    constexpr int thread_m = 2 * m_iter_cnt;
     constexpr int thread_n = 2 * n_iter_cnt;
     constexpr int cta_mma_n = n_iter_cnt * 8;
     float acc_reg_reorg[thread_m][thread_n];
 
     for (int i = 0; i < thread_m; i++) {
       for (int j = 0; j < thread_n; j++) {
-        acc_reg_reorg[i][j] = acc_reg[0][j / 2][(j % 2) + (i * 2)];
+        acc_reg_reorg[i][j] = acc_reg[i / 2][j / 2][(j % 2) + (i % 2) * 2];
       }
     }
 
@@ -514,7 +522,8 @@ struct MmaComputer {
     for (int m_idx_thread = 0; m_idx_thread < thread_m; m_idx_thread++) {
   #pragma unroll
       for (int n_idx_thread = 0; n_idx_thread < thread_n; n_idx_thread++) {
-        int m_idx = (lane_idx / 4) + m_idx_thread * 8;
+        int m_idx = (lane_idx / 4) + (m_idx_thread % 2) * 8
+                    + (m_idx_thread / 2) * 16;
         int n_idx =
             ((lane_idx % 4) * 2) + (n_idx_thread % 2) + (n_idx_thread / 2) * 8;
         smem_c[cosize_smem_c * warp_idx + smem_c_index_func(m_idx, n_idx)] =
@@ -587,7 +596,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
   static_assert(
       tile_k == 128 || tile_k == 256 || tile_k == 512 ||
       tile_k == 1024);  // tile_k must be larger than 64 since 4 warp splitK.
-  static_assert(tile_m == 16);
+  static_assert(tile_m == 16 || tile_m == 32);
   constexpr int g2s_vec_bytes = 16;
   constexpr int a_elem_bytes = 2;
   constexpr int b_elem_bytes = 2;
@@ -647,15 +656,15 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 #endif
 }
 
-template <typename T, int kHdIn, int kHdOut, int kTileN>
+template <typename T, int kHdIn, int kHdOut, int kTileN, int kTileM = 16>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
                       cudaStream_t const stream) {
-  constexpr int gemm_m = kHdOut;  // 2112
-  int const gemm_n = num_tokens;  // 1-16
-  constexpr int gemm_k = kHdIn;   // 7168
+  constexpr int gemm_m = kHdOut;
+  int const gemm_n = num_tokens;
+  constexpr int gemm_k = kHdIn;
   constexpr int batch_size = 1;
   std::swap(mat_a, mat_b);
-  constexpr int tile_m = 16;
+  constexpr int tile_m = kTileM;
   constexpr int tile_n = kTileN;                        // 8 or 16
   constexpr int tile_k = std::max(256, 1024 / tile_n);  // 256
   constexpr int max_stage_cnt =
@@ -694,13 +703,45 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
                      output, mat_a, mat_b, gemm_n);
 }
 
-template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
+// DSV3: hd_in=7168, hd_out=2112, tile_m=16
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
     cudaStream_t);
 
-template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
     cudaStream_t);
+
+// GLM-5.2 QKV-A: hd_in=6144, hd_out=2624, tile_m=32
+template void invokeFusedAGemm<__nv_bfloat16, 6144, 2624, 8, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
+    cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 6144, 2624, 16, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
+    cudaStream_t);
+
+// GLM-5.2 Q-B: hd_in=2048, hd_out=4096 (TP=4), tile_m=32
+template void invokeFusedAGemm<__nv_bfloat16, 2048, 4096, 8, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
+    cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 2048, 4096, 16, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
+    cudaStream_t);
+
+template <int kHdIn, int kHdOut, int kTileM>
+void dispatchByTokenCount(__nv_bfloat16* output, __nv_bfloat16 const* mat_a,
+                          __nv_bfloat16 const* mat_b, int num_tokens,
+                          cudaStream_t stream) {
+  if (num_tokens <= 8) {
+    invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8, kTileM>(
+        output, mat_a, mat_b, num_tokens, stream);
+  } else {
+    invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 16, kTileM>(
+        output, mat_a, mat_b, num_tokens, stream);
+  }
+}
 
 void dsv3_fused_a_gemm(torch::stable::Tensor& output,
                        torch::stable::Tensor const& mat_a,
@@ -710,12 +751,8 @@ void dsv3_fused_a_gemm(torch::stable::Tensor& output,
   int const hd_in = mat_a.size(1);
   int const hd_out = mat_b.size(1);
 
-  constexpr int kHdIn = 7168;
-  constexpr int kHdOut = 2112;
   STD_TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
                   "required 1 <= mat_a.shape[0] <= 16");
-  STD_TORCH_CHECK(hd_in == kHdIn, "required mat_a.shape[1] == 7168");
-  STD_TORCH_CHECK(hd_out == kHdOut, "required mat_b.shape[1] == 2112");
   STD_TORCH_CHECK(output.size(0) == num_tokens,
                   "required output.shape[0] == mat_a.shape[0]");
   STD_TORCH_CHECK(output.size(1) == hd_out,
@@ -738,18 +775,23 @@ void dsv3_fused_a_gemm(torch::stable::Tensor& output,
   STD_TORCH_CHECK(getSMVersion() >= 90, "required CUDA ARCH >= SM_90");
 
   auto stream = get_current_cuda_stream(mat_a.get_device_index());
-  if (num_tokens <= 8) {
-    invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8>(
-        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
-        stream);
+  auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr());
+  auto* a_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr());
+  auto* b_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr());
+
+  if (hd_in == 7168 && hd_out == 2112) {
+    dispatchByTokenCount<7168, 2112, 16>(out_ptr, a_ptr, b_ptr, num_tokens,
+                                         stream);
+  } else if (hd_in == 6144 && hd_out == 2624) {
+    dispatchByTokenCount<6144, 2624, 32>(out_ptr, a_ptr, b_ptr, num_tokens,
+                                         stream);
+  } else if (hd_in == 2048 && hd_out == 4096) {
+    dispatchByTokenCount<2048, 4096, 32>(out_ptr, a_ptr, b_ptr, num_tokens,
+                                         stream);
   } else {
-    invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 16>(
-        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
-        stream);
+    STD_TORCH_CHECK(false,
+                    "dsv3_fused_a_gemm: unsupported shape (hd_in=", hd_in,
+                    ", hd_out=", hd_out, ")");
   }
 }
 
