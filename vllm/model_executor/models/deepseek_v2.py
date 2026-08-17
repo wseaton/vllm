@@ -91,6 +91,10 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.kernels.fused_a_gemm import (
+    _load_jit_module,
+    is_fused_a_gemm_eligible,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -921,26 +925,22 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
             prefix=prefix,
         )
 
-        # Check if the DeepSeek V3 fused A GEMM kernel can be used.
+        # Check if the fused A GEMM kernel can be used.
         # This kernel supports PDL and is optimized for low batch size.
         self._use_min_latency_gemm = (
             hasattr(self, "weight")
-            and self.weight.dtype == torch.bfloat16
-            and self.weight.shape[0] == 2112
-            and self.weight.shape[1] == 7168
-            and current_platform.is_cuda()
-            and (
-                current_platform.is_device_capability(90)
-                or current_platform.is_device_capability_family(100)
-            )
+            and is_fused_a_gemm_eligible(self.weight)
         )
+        # Eagerly compile JIT module during init (before CUDA graph capture)
+        if self._use_min_latency_gemm:
+            _load_jit_module(self.weight.shape[1], self.weight.shape[0])
 
     def forward(
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.nn.Parameter | None]:
         if self._use_min_latency_gemm:
-            output = torch.ops.vllm.min_latency_fused_qkv_a_proj(input_, self.weight)
+            output = torch.ops.vllm.fused_a_gemm_jit(input_, self.weight)
             if not self.return_bias:
                 return output
             output_bias = self.bias if self.skip_bias_add else None
