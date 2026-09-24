@@ -4,8 +4,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use openssl::error::ErrorStack;
+use openssl::md::Md;
+use openssl::md_ctx::MdCtx;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
@@ -25,8 +27,13 @@ const SHUTDOWN_REFCOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) type ApiKeyHash = [u8; 32];
 
-pub(crate) fn hash_api_key(api_key: &str) -> ApiKeyHash {
-    Sha256::digest(api_key.as_bytes()).into()
+pub(crate) fn hash_api_key(api_key: &str) -> Result<ApiKeyHash, ErrorStack> {
+    let mut digest = ApiKeyHash::default();
+    let mut ctx = MdCtx::new()?;
+    ctx.digest_init(Md::sha256())?;
+    ctx.digest_update(api_key.as_bytes())?;
+    ctx.digest_final(&mut digest)?;
+    Ok(digest)
 }
 
 /// Shared router state for the minimal single-model OpenAI server.
@@ -125,13 +132,13 @@ impl AppState {
     }
 
     /// Configure API keys accepted by guarded HTTP routes.
-    pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
+    pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Result<Self, ErrorStack> {
         self.api_key_hashes = api_keys
             .into_iter()
             .filter(|key| !key.is_empty())
             .map(|key| hash_api_key(&key))
-            .collect();
-        self
+            .collect::<Result<_, _>>()?;
+        Ok(self)
     }
 
     pub(crate) fn has_api_keys(&self) -> bool {

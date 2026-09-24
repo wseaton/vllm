@@ -887,7 +887,9 @@ async fn test_app_with_api_keys(api_keys: Vec<String>) -> (axum::Router, MockEng
     )
     .await;
     let app = build_router(Arc::new(
-        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat).with_api_keys(api_keys),
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+            .with_api_keys(api_keys)
+            .expect("hash api keys"),
     ));
     (app, engine_task)
 }
@@ -905,7 +907,8 @@ async fn test_app_with_cors_and_keys(
     let app = build_router(Arc::new(
         AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
             .with_cors(cors)
-            .with_api_keys(api_keys),
+            .with_api_keys(api_keys)
+            .expect("hash api keys"),
     ));
     (app, engine_task)
 }
