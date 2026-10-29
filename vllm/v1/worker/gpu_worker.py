@@ -441,10 +441,15 @@ class Worker(WorkerBase):
         if self._checkpoint_graphs_captured():
             self._v2_model_runner().release_cuda_graphs()
             self._checkpoint_graphs_released = True
+        # Connectors are created after the communicators, so release them first.
+        if has_kv_transfer_group():
+            get_kv_transfer_group().checkpoint_prepare()
         checkpoint_prepare_distributed_state()
 
     def checkpoint_restore(self) -> None:
         checkpoint_restore_distributed_state()
+        if has_kv_transfer_group():
+            get_kv_transfer_group().checkpoint_restore()
 
     def _capture_released_graphs(self) -> None:
         """Capture the graphs `checkpoint_prepare` released."""
