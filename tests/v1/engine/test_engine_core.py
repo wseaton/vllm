@@ -6,7 +6,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 from transformers import AutoTokenizer
@@ -875,6 +875,7 @@ def test_checkpoint_prepare_then_restore_run_in_order():
     scheduling resumes. Repeating either is a no-op."""
     core = _pausable_engine_core_proc()
     core.vllm_config = MagicMock()
+    core.vllm_config.model_config.checkpoint_release_weights = False
     core.model_executor.is_sleeping = False
     core._reset_caches = MagicMock()
     core.reject_new_requests = False
@@ -900,12 +901,66 @@ def test_checkpoint_prepare_then_restore_run_in_order():
     assert not core.reject_new_requests
 
 
+def test_checkpoint_release_weights_discards_then_reloads():
+    """With checkpoint_release_weights, preparing discards the weights after
+    the KV cache, before the external state. Restoring wakes and reloads the
+    weights after the external state and before the KV cache, and scheduling
+    resumes only once both are resident."""
+    core = _pausable_engine_core_proc()
+    core.vllm_config = MagicMock()
+    core.vllm_config.model_config.checkpoint_release_weights = True
+    core._reset_caches = MagicMock()
+    core.reject_new_requests = False
+    core.scheduler.get_kv_connector.return_value = None
+    executor = core.model_executor
+    sleeping: set[str] = set()
+    type(executor).is_sleeping = property(lambda _: bool(sleeping))
+    executor.discard.side_effect = sleeping.update
+    executor.wake_up.side_effect = sleeping.difference_update
+
+    assert core.checkpoint_prepare("wait") is None
+    assert core.checkpoint_state() == (CheckpointState.PREPARED, None)
+    assert sleeping == {"kv_cache", "weights"}
+    assert [c for c in executor.mock_calls if c[0] == "discard"] == [
+        call.discard(("kv_cache",)),
+        call.discard(("weights",)),
+    ]
+    assert _executor_calls(core) == [
+        "synchronize_device",
+        "discard",
+        "discard",
+        "checkpoint_prepare",
+        "synchronize_device",
+    ]
+
+    executor.reset_mock()
+    core.scheduler.reset_mock()
+    order: list[str] = []
+    executor.collective_rpc.side_effect = lambda method: order.append(method)
+    executor.wake_up.side_effect = lambda tags: (
+        order.append(f"wake_up {tags}"),
+        sleeping.difference_update(tags),
+    )
+    core.scheduler.set_pause_state.side_effect = lambda state: order.append(str(state))
+    core.checkpoint_restore()
+    assert core.checkpoint_state() == (CheckpointState.RUNNING, None)
+    assert not sleeping
+    assert order == [
+        "checkpoint_restore",
+        "wake_up ['weights']",
+        "reload_weights",
+        "wake_up ['kv_cache']",
+        str(PauseState.UNPAUSED),
+    ]
+
+
 @pytest.mark.parametrize("deferred", [False, True])
 def test_checkpoint_prepare_fails_on_drain_barrier_error(deferred: bool):
     """A failing barrier at the end of the drain leaves the engine FAILED and
     still rejecting, whether the drain completes at once or later."""
     core = _pausable_engine_core_proc()
     core.vllm_config = MagicMock()
+    core.vllm_config.model_config.checkpoint_release_weights = False
     core.model_executor.is_sleeping = False
     core.model_executor.collective_rpc.side_effect = RuntimeError("device lost")
     core.reject_new_requests = False

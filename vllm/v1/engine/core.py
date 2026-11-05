@@ -1003,6 +1003,8 @@ class EngineCore:
                 self._set_kv_cache_reclaimable(True)
             if preparing:
                 self.release_kv_cache_memory()
+                if self.vllm_config.model_config.checkpoint_release_weights:
+                    self.model_executor.discard(("weights",))
                 self.collective_rpc("checkpoint_prepare")
                 self.collective_rpc("synchronize_device")
                 self._checkpoint_state = CheckpointState.PREPARED
@@ -2424,9 +2426,10 @@ class EngineCoreProc(EngineCore):
         self.reject_new_requests = False
 
     def checkpoint_prepare(self, mode: PauseMode = "wait") -> str | None:
-        """Drain with `mode`, then release the KV cache and what a process
-        checkpoint must not contain, such as communicator state. The state
-        becomes PREPARED once the drain completes. Repeating is a no-op.
+        """Drain with `mode`, then release the KV cache, the weights with
+        `checkpoint_release_weights`, and what a process checkpoint must not
+        contain, such as communicator state. The state becomes PREPARED once
+        the drain completes. Repeating is a no-op.
 
         Returns:
             Why the engine cannot prepare, with nothing changed, or None.
@@ -2451,8 +2454,9 @@ class EngineCoreProc(EngineCore):
         return None
 
     def checkpoint_restore(self) -> None:
-        """Bring back what preparing released, wake the KV cache and resume
-        scheduling. Repeating is a no-op."""
+        """Bring back what preparing released, reload released weights through
+        the model loader, wake the KV cache and resume scheduling. Repeating is
+        a no-op."""
         state = self._checkpoint_state
         if state.is_restored:
             return
@@ -2462,6 +2466,9 @@ class EngineCoreProc(EngineCore):
         self._checkpoint_state = CheckpointState.RESTORING
         try:
             self.collective_rpc("checkpoint_restore")
+            if self.vllm_config.model_config.checkpoint_release_weights:
+                self.wake_up(["weights"])
+                self.collective_rpc("reload_weights")
             self.wake_up(["kv_cache"])
         except Exception as e:
             self._fail_checkpoint(e)

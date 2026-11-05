@@ -337,18 +337,8 @@ class Worker(WorkerBase):
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
 
-        # Save the buffers before level 2 sleep
         if level == 2:
-            model = self.model_runner.model
-            self._save_sleep_parameters(model)
-            self._sleep_saved_buffers = {
-                name: buffer.cpu().clone() for name, buffer in model.named_buffers()
-            }
-            draft = self.get_draft_model()
-            if draft is not None:
-                self._sleep_saved_draft_buffers = {
-                    name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
-                }
+            self._save_discarded_weight_state()
 
         if has_kv_transfer_group():
             get_kv_transfer_group().unregister_kv_caches()
@@ -415,7 +405,26 @@ class Worker(WorkerBase):
         if loader is not None:
             loader.on_wake_up(tags)
 
+    def _save_discarded_weight_state(self) -> None:
+        """Save what a weight reload does not bring back: buffers and the
+        parameters named by `sleep_preserve_parameter_names`."""
+        model = self.model_runner.model
+        self._save_sleep_parameters(model)
+        self._sleep_saved_buffers = {
+            name: buffer.cpu().clone() for name, buffer in model.named_buffers()
+        }
+        draft = self.get_draft_model()
+        if draft is not None:
+            self._sleep_saved_draft_buffers = {
+                name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
+            }
+
     def discard(self, tags: tuple[str, ...]) -> None:
+        if "weights" in tags:
+            loader = self.model_runner.model_loader
+            if loader is not None:
+                loader.on_sleep(2)
+            self._save_discarded_weight_state()
         if has_kv_transfer_group() and "kv_cache" in tags:
             get_kv_transfer_group().unregister_kv_caches()
         # Outside the allocator pool, like in sleep.

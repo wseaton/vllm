@@ -399,6 +399,10 @@ class ModelConfig:
     """Prepare each engine for a process checkpoint once it starts, as
     `/checkpoint/prepare` does. It serves only after `/checkpoint/restore`.
     Requires sleep mode."""
+    checkpoint_release_weights: bool = False
+    """Also discard the weights when preparing for a process checkpoint, so the
+    checkpoint does not contain them, and reload them through the model loader
+    when restoring. Requires sleep mode."""
     enable_cumem_allocator: bool = False
     """Enable the custom cumem allocator to leverage advanced GPU memory
     allocation features such as multi-node NVLink support.
@@ -512,6 +516,7 @@ class ModelConfig:
             "skip_mm_profiling",
             "mm_ipc_gpu_memory_gb",
             "checkpoint_prepare_on_startup",
+            "checkpoint_release_weights",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -677,6 +682,8 @@ class ModelConfig:
 
         if self.checkpoint_prepare_on_startup and not self.enable_sleep_mode:
             raise ValueError("checkpoint_prepare_on_startup requires enable_sleep_mode")
+        if self.checkpoint_release_weights and not self.enable_sleep_mode:
+            raise ValueError("checkpoint_release_weights requires enable_sleep_mode")
         if self.enable_sleep_mode:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")
