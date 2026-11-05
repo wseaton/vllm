@@ -936,7 +936,7 @@ def test_checkpoint_release_weights_discards_then_reloads():
     executor.reset_mock()
     core.scheduler.reset_mock()
     order: list[str] = []
-    executor.collective_rpc.side_effect = lambda method: order.append(method)
+    executor.collective_rpc.side_effect = lambda method, *_: order.append(method)
     executor.wake_up.side_effect = lambda tags: (
         order.append(f"wake_up {tags}"),
         sleeping.difference_update(tags),
