@@ -114,6 +114,7 @@ from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
+    CudaGraphManager,
     ModelCudaGraphManager,
     has_compiled_submodule,
     make_cudagraph_stats,
@@ -1152,6 +1153,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cudagraph_manager is not None
             and self.cudagraph_manager.needs_capture()
         )
+
+    def release_cuda_graphs(self) -> None:
+        """Drop every captured CUDA graph so `capture_model` can capture them
+        again, for example after the communicators they replay are replaced."""
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.release_graphs()
+        for attr in vars(self.speculator).values() if self.speculator else ():
+            if isinstance(attr, CudaGraphManager):
+                attr.release_graphs()
+        CUDAGraphWrapper.clear_all_graphs()
+        BreakableCUDAGraphWrapper.clear_all_graphs()
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:

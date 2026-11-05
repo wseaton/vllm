@@ -122,7 +122,7 @@ from vllm.v1.worker.startup_plan import (
     maybe_save_startup_plan,
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import init_workspace_manager, unlock_workspace
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
@@ -225,6 +225,7 @@ class Worker(WorkerBase):
         is_driver_worker: bool = False,
     ):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self._checkpoint_graphs_released = False
         if (
             self.use_v2_model_runner
             and not HAS_TRITON
@@ -405,6 +406,9 @@ class Worker(WorkerBase):
         if loader is not None:
             loader.on_wake_up(tags)
 
+        if wake_kv_cache and self._checkpoint_graphs_released:
+            self._capture_released_graphs()
+
     def _save_discarded_weight_state(self) -> None:
         """Save what a weight reload does not bring back: buffers and the
         parameters named by `sleep_preserve_parameter_names`."""
@@ -434,10 +438,30 @@ class Worker(WorkerBase):
         self.sleep_mode_backend.discard(tags)
 
     def checkpoint_prepare(self) -> None:
+        if self._checkpoint_graphs_captured():
+            self._v2_model_runner().release_cuda_graphs()
+            self._checkpoint_graphs_released = True
         checkpoint_prepare_distributed_state()
 
     def checkpoint_restore(self) -> None:
         checkpoint_restore_distributed_state()
+
+    def _capture_released_graphs(self) -> None:
+        """Capture the graphs `checkpoint_prepare` released."""
+        unlock_workspace()
+        with self._get_cudagraph_capture_context():
+            self.model_runner.capture_model()
+        self._checkpoint_graphs_released = False
+
+    def _checkpoint_graphs_captured(self) -> bool:
+        if self.model_config.enforce_eager or self.parallel_config.world_size == 1:
+            return False
+        if not self.use_v2_model_runner:
+            raise NotImplementedError(
+                "A process checkpoint with CUDA graphs and tensor parallelism "
+                "requires the V2 model runner"
+            )
+        return True
 
     def _weight_checksum_prefix(self) -> str:
         # data_parallel_rank is 0 in dense workers; only the index is unique.

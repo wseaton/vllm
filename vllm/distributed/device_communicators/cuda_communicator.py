@@ -888,17 +888,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         checkpoint_restore_fi_ar_workspaces(self.cpu_group, skip_unsupported=True)
 
     def checkpoint_prepare(self) -> None:
-        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+        # Only FlashInfer all-reduce, FlashInfer all2all and NCCL are supported
+        # for now.
         from .flashinfer_all_reduce import checkpoint_prepare_fi_ar_workspaces
 
         checkpoint_prepare_fi_ar_workspaces(self.cpu_group)
         if self.all2all_manager is not None:
             self.all2all_manager.checkpoint_prepare()
+        if self.pynccl_comm is not None:
+            self.pynccl_comm.checkpoint_release()
 
     def checkpoint_restore(self) -> None:
-        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+        # Only FlashInfer all-reduce, FlashInfer all2all and NCCL are supported
+        # for now.
         from .flashinfer_all_reduce import checkpoint_restore_fi_ar_workspaces
 
+        if self.pynccl_comm is not None:
+            self.pynccl_comm.checkpoint_recreate()
         checkpoint_restore_fi_ar_workspaces(self.cpu_group)
         if self.all2all_manager is not None:
             self.all2all_manager.checkpoint_restore()

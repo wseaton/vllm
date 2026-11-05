@@ -140,14 +140,19 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
         self._suspended = False
+        self._released = False
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
-            # get the unique id from NCCL
-            self.unique_id = self.nccl.ncclGetUniqueId()
             logger.info_once("vLLM is using nccl==%s", self.nccl.ncclGetVersion())
+        self._share_unique_id(group)
+        self._init_comm(device)
+
+    def _share_unique_id(self, group: ProcessGroup | StatelessProcessGroup) -> None:
+        """Get a new unique id on rank 0 and broadcast it over `group`."""
+        if self.rank == 0:
+            self.unique_id = self.nccl.ncclGetUniqueId()
         else:
-            # construct an empty unique id
             self.unique_id = ncclUniqueId()
 
         if not isinstance(group, StatelessProcessGroup):
@@ -160,7 +165,6 @@ class PyNcclCommunicator:
                 self.unique_id.internal[i] = byte
         else:
             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
-        self._init_comm(device)
 
     def _init_comm(self, device: int | str | torch.device) -> None:
         """Create the communicator on `device` from the already-resolved
@@ -639,6 +643,27 @@ class PyNcclCommunicator:
 
     def deregister_comm_window(self, window):
         return self.nccl.ncclCommWindowDeregister(self.comm, window)
+
+    def checkpoint_release(self) -> None:
+        """Destroy the communicator before a process checkpoint (collective,
+        idempotent). Every CUDA graph that captured an op on it must already
+        be released."""
+        if self.disabled or self._released:
+            return
+        with torch.accelerator.device_index(self.device.index):
+            self.nccl.ncclCommDestroy(self.comm)
+        self._released = True
+
+    def checkpoint_recreate(self) -> None:
+        """Create a new communicator after a process checkpoint (collective,
+        no-op unless released). The process may now run on other GPUs, which
+        invalidates the peer mappings of the old communicator."""
+        if self.disabled or not self._released:
+            return
+        assert self.group is not None
+        self._share_unique_id(self.group)
+        self._init_comm(self.device)
+        self._released = False
 
     def suspend(self):
         """Release comm GPU memory (collective, idempotent); keeps topology."""
