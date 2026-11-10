@@ -398,7 +398,7 @@ class ModelConfig:
     checkpoint_prepare_on_startup: bool = False
     """Prepare each engine for a process checkpoint once it starts, as
     `/checkpoint/prepare` does. It serves only after `/checkpoint/restore`.
-    Requires sleep mode."""
+    Requires sleep mode and an engine core in its own process."""
     checkpoint_release_weights: bool = False
     """Also discard the weights when preparing for a process checkpoint, so the
     checkpoint does not contain them, and reload them through the model loader
