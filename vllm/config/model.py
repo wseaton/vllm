@@ -403,6 +403,10 @@ class ModelConfig:
     """Also discard the weights when preparing for a process checkpoint, so the
     checkpoint does not contain them, and reload them through the model loader
     when restoring. Requires sleep mode."""
+    checkpoint_release_kv_offload: bool = False
+    """Also free the host memory of the KV offloading connector when preparing
+    for a process checkpoint, so the checkpoint does not contain it, and
+    allocate it again when restoring. Requires sleep mode."""
     enable_cumem_allocator: bool = False
     """Enable the custom cumem allocator to leverage advanced GPU memory
     allocation features such as multi-node NVLink support.
@@ -517,6 +521,7 @@ class ModelConfig:
             "mm_ipc_gpu_memory_gb",
             "checkpoint_prepare_on_startup",
             "checkpoint_release_weights",
+            "checkpoint_release_kv_offload",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -684,6 +689,8 @@ class ModelConfig:
             raise ValueError("checkpoint_prepare_on_startup requires enable_sleep_mode")
         if self.checkpoint_release_weights and not self.enable_sleep_mode:
             raise ValueError("checkpoint_release_weights requires enable_sleep_mode")
+        if self.checkpoint_release_kv_offload and not self.enable_sleep_mode:
+            raise ValueError("checkpoint_release_kv_offload requires enable_sleep_mode")
         if self.enable_sleep_mode:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")

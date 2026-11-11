@@ -441,10 +441,20 @@ class Worker(WorkerBase):
         if self._checkpoint_graphs_captured():
             self._v2_model_runner().release_cuda_graphs()
             self._checkpoint_graphs_released = True
+        if self._checkpoint_releases_kv_offload():
+            get_kv_transfer_group().checkpoint_release_host_memory()
         checkpoint_prepare_distributed_state()
 
     def checkpoint_restore(self) -> None:
         checkpoint_restore_distributed_state()
+        if self._checkpoint_releases_kv_offload():
+            get_kv_transfer_group().checkpoint_restore_host_memory()
+
+    def _checkpoint_releases_kv_offload(self) -> bool:
+        return (
+            self.vllm_config.model_config.checkpoint_release_kv_offload
+            and has_kv_transfer_group()
+        )
 
     def _capture_released_graphs(self) -> None:
         """Capture the graphs `checkpoint_prepare` released."""

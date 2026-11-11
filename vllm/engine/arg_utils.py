@@ -811,6 +811,7 @@ class EngineArgs:
     enable_nccl_comm_suspend: bool = ModelConfig.enable_nccl_comm_suspend
     checkpoint_prepare_on_startup: bool = ModelConfig.checkpoint_prepare_on_startup
     checkpoint_release_weights: bool = ModelConfig.checkpoint_release_weights
+    checkpoint_release_kv_offload: bool = ModelConfig.checkpoint_release_kv_offload
     override_generation_config: dict[str, Any] = get_field(
         ModelConfig, "override_generation_config"
     )
@@ -1078,6 +1079,10 @@ class EngineArgs:
         model_group.add_argument(
             "--checkpoint-release-weights",
             **model_kwargs["checkpoint_release_weights"],
+        )
+        model_group.add_argument(
+            "--checkpoint-release-kv-offload",
+            **model_kwargs["checkpoint_release_kv_offload"],
         )
         model_group.add_argument("--model-impl", **model_kwargs["model_impl"])
         model_group.add_argument(
@@ -2085,6 +2090,7 @@ class EngineArgs:
             enable_nccl_comm_suspend=self.enable_nccl_comm_suspend,
             checkpoint_prepare_on_startup=self.checkpoint_prepare_on_startup,
             checkpoint_release_weights=self.checkpoint_release_weights,
+            checkpoint_release_kv_offload=self.checkpoint_release_kv_offload,
             model_impl=self.model_impl,
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,

@@ -347,6 +347,14 @@ class OffloadingConnectorWorker:
         self._connector_worker_meta = OffloadingWorkerMetadata()
         return meta
 
+    def checkpoint_release(self) -> None:
+        if self.worker is not None:
+            self.worker.checkpoint_release()
+
+    def checkpoint_restore(self) -> None:
+        if self.worker is not None:
+            self.worker.checkpoint_restore()
+
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()

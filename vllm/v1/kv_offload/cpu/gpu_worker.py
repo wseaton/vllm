@@ -3,7 +3,7 @@
 import functools
 import time
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -785,12 +785,17 @@ class CPUOffloadingWorker(OffloadingWorker):
         num_cpu_chunks: int,
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
+        barrier: Callable[[], None] | None = None,
     ):
         assert not canonical_layout or mmap_region is not None
+        self._barrier = barrier
         # The caller owns mmap_region until this constructor returns. After a
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
         self._mmap_region = mmap_region
+        self._canonical_layout = canonical_layout
+        self._checkpoint_released = False
+        self._checkpoint_repin = False
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
@@ -878,6 +883,37 @@ class CPUOffloadingWorker(OffloadingWorker):
         self._store_handler.wait(job_ids)
         self._load_handler.wait(job_ids)
         self._expedited_load_handler.wait(job_ids)
+
+    def checkpoint_release(self) -> None:
+        region = self._mmap_region
+        if region is None or self._barrier is None or self._checkpoint_released:
+            return
+        self._checkpoint_repin = region.is_pinned
+        region.unpin()
+        # Pages another rank still has registered would stay allocated.
+        self._barrier()
+        region.release_pages()
+        self._checkpoint_released = True
+
+    def checkpoint_restore(self) -> None:
+        region = self._mmap_region
+        if region is None or not self._checkpoint_released:
+            return
+        start = time.monotonic()
+        region.populate()
+        if self._checkpoint_repin:
+            pin_mmap_region(region, worker_slot_only=not self._canonical_layout)
+            if not region.is_pinned:
+                raise RuntimeError(
+                    "Failed to register the CPU offload region again after a "
+                    "process checkpoint"
+                )
+        self._checkpoint_released = False
+        logger.info(
+            "Restored the %.2f GB CPU offload region in %.2f s",
+            region.total_size_bytes / 1e9,
+            time.monotonic() - start,
+        )
 
     def shutdown(self) -> None:
         handler_failed = False
