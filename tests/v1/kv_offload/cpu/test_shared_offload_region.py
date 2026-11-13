@@ -1468,3 +1468,47 @@ def test_barrier_release_failure_keeps_original_error(iid, monkeypatch, failure_
 
     assert barrier.call_count == (2 if failure_phase == "population" else 1)
     assert not os.path.exists(f"/dev/shm/vllm_offload_{iid}.mmap")
+
+
+def _shm_blocks(region: SharedOffloadRegion) -> int:
+    assert region.fd is not None
+    return os.fstat(region.fd).st_blocks
+
+
+def test_release_pages_frees_memory_and_populate_brings_it_back(iid):
+    num_chunks = 8
+    region = _make_region(iid, num_chunks=num_chunks)
+    try:
+        view = region.create_next_worker_view(PAGE_SIZE)
+        view.fill_(7)
+        address = view.data_ptr()
+        assert _shm_blocks(region) * 512 == num_chunks * PAGE_SIZE
+
+        region.release_pages()
+        assert _shm_blocks(region) == 0
+
+        region.release_pages()
+        region.populate()
+        assert _shm_blocks(region) * 512 == num_chunks * PAGE_SIZE
+        assert view.data_ptr() == address
+        assert int(view.abs().sum()) == 0
+        view.fill_(3)
+        assert int(view.sum()) == 3 * num_chunks * PAGE_SIZE
+        del view
+    finally:
+        region.cleanup()
+
+
+def test_release_pages_is_shared_between_workers(iid):
+    creator = _make_region(iid, num_workers=2, rank=0)
+    joiner = _make_region(iid, num_workers=2, rank=1)
+    try:
+        assert _shm_blocks(creator) * 512 == creator.total_size_bytes
+        creator.release_pages()
+        assert _shm_blocks(joiner) == 0
+        creator.populate()
+        joiner.populate()
+        assert _shm_blocks(joiner) * 512 == joiner.total_size_bytes
+    finally:
+        joiner.cleanup()
+        creator.cleanup()

@@ -24,6 +24,7 @@ logger = init_logger(__name__)
 
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+_MADV_REMOVE = getattr(mmap, "MADV_REMOVE", 9)
 _MAP_FIXED = 0x10
 # Page-cache inserts are serialized per shm file, capping pre-faulting of one
 # file near 10 GiB/s; smaller segments are not worth a file.
@@ -145,6 +146,7 @@ class SharedOffloadRegion:
         ]
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
+        self._populate_shard = populate_shard
         if rank is not None:
             # byte offset to this worker's first slot within each chunk row
             self._worker_offset = rank * cpu_page_size
@@ -216,13 +218,7 @@ class SharedOffloadRegion:
                     self._creator = False
                     logger.info("Unlinked mmap file %s", self.mmap_path)
             if populate_shard is not None:
-                populate_write_fn = _get_populate_write_fn(self.mmap_obj)
-                index, count = populate_shard
-                share = round_up(cdiv(self.total_size_bytes, count), self.page_size)
-                start = min(index * share, self.total_size_bytes)
-                if start < self.total_size_bytes:
-                    length = min(share, self.total_size_bytes - start)
-                    populate_write_fn(self.mmap_obj, start, length)
+                self.populate()
                 if barrier is not None:
                     barriers_remaining -= 1
                     barrier()
@@ -257,27 +253,44 @@ class SharedOffloadRegion:
         self.is_pinned: bool = False
         self.pinned_addresses: list[int] = []
 
-        if populate_shard is not None:
-            return
-        populate_write_fn = _get_populate_write_fn(self.mmap_obj)
+        if populate_shard is None:
+            self.populate()
 
-        if rank is not None:
-            # Populate only this worker's pages (one slot per chunk row).
-            _t0 = time.perf_counter()
+    def populate(self) -> None:
+        """Pre-fault this worker's part of the region: its shard, its slot in
+        each chunk row, or without a rank the whole region."""
+        assert self.mmap_obj is not None
+        populate_write_fn = _get_populate_write_fn(self.mmap_obj)
+        _t0 = time.perf_counter()
+        if self._populate_shard is not None:
+            index, count = self._populate_shard
+            share = round_up(cdiv(self.total_size_bytes, count), self.page_size)
+            start = min(index * share, self.total_size_bytes)
+            if start < self.total_size_bytes:
+                length = min(share, self.total_size_bytes - start)
+                populate_write_fn(self.mmap_obj, start, length)
+        elif self.rank is not None:
             for offset, length in self.iter_worker_slot_ranges():
                 populate_write_fn(self.mmap_obj, offset, length)
-            logger.debug(
-                "MADV_POPULATE_WRITE loop: %d chunks in %.3f s",
-                num_chunks,
-                time.perf_counter() - _t0,
-            )
         else:
-            # No rank — populate the entire shared region in one call.
-            _t0 = time.perf_counter()
             populate_write_fn(self.mmap_obj, 0, self.total_size_bytes)
-            logger.debug(
-                "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
-            )
+        logger.debug("MADV_POPULATE_WRITE: %.3f s", time.perf_counter() - _t0)
+
+    def unpin(self) -> None:
+        """Drop this worker's host registrations."""
+        if not self.is_pinned or self._base is None:
+            return
+        addresses = self.pinned_addresses or [self._base.data_ptr()]
+        for address in reversed(addresses):
+            host_unregister(address)
+        self.pinned_addresses.clear()
+        self.is_pinned = False
+
+    def release_pages(self) -> None:
+        """Free the region's memory and keep its mappings. The contents are
+        lost, and every worker must have unpinned first. Idempotent."""
+        assert self.mmap_obj is not None
+        self.mmap_obj.madvise(_MADV_REMOVE, 0, self.total_size_bytes)
 
     def _map_segments(self) -> None:
         """Replace the anonymous mapping with the segment files, back to back."""
@@ -426,13 +439,7 @@ class SharedOffloadRegion:
         return memoryview(np_arr)
 
     def cleanup(self) -> None:
-        if self.is_pinned and self._base is not None:
-            base_ptr = self._base.data_ptr()
-            addresses = self.pinned_addresses or [base_ptr]
-            for address in reversed(addresses):
-                host_unregister(address)
-            self.pinned_addresses.clear()
-            self.is_pinned = False
+        self.unpin()
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
         # drop so the storage (which holds the mmap_obj buffer export) is freed

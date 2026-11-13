@@ -328,6 +328,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
         return metrics
 
+    @classmethod
+    @override
+    def supports_checkpoint(cls) -> bool:
+        return False
+
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it

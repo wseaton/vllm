@@ -187,6 +187,22 @@ def test_sleep_mode_refuses_unsupported_kv_connector(
         )
 
 
+@pytest.mark.parametrize(
+    "extra_config,supported",
+    [(None, True), ({"spec_name": "TieringOffloadingSpec"}, False)],
+)
+def test_offloading_connector_opts_in_to_process_checkpoints(extra_config, supported):
+    """The CPU spec's region is released for a process checkpoint; the tiering
+    spec's is not."""
+    config = _build_config(
+        kv_connector="OffloadingConnector",
+        kv_connector_extra_config=extra_config,
+        enable_sleep_mode=True,
+    )
+    connector_cls = KVConnectorFactory.get_connector_class(config.kv_transfer_config)
+    assert connector_cls.supports_checkpoint(config) == supported
+
+
 def test_mooncake_store_supports_sleep_with_explicit_rdma(monkeypatch, tmp_path):
     """Disabling auto-discovery keeps explicit RDMA despite NVLink overrides."""
     monkeypatch.setitem(sys.modules, "mooncake", None)

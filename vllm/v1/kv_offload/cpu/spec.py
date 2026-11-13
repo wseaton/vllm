@@ -179,6 +179,11 @@ class CPUOffloadingSpec(OffloadingSpec):
             current_platform.is_cuda_alike() and not current_platform.is_rocm()
         ) or current_platform.is_xpu()
 
+    @classmethod
+    @override
+    def supports_checkpoint(cls) -> bool:
+        return True
+
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None
         # num_chunks == 0 would size the region to zero bytes, which cannot be
@@ -207,6 +212,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
+                barrier=_all_workers_barrier,
             )
         except Exception:
             if mmap_region is not None:
