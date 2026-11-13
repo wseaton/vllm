@@ -108,6 +108,20 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                 spec, vllm_config, kv_cache_config
             )
 
+    @classmethod
+    def supports_checkpoint(cls, vllm_config: VllmConfig) -> bool:
+        assert vllm_config.kv_transfer_config is not None
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        return OffloadingSpecFactory.get_spec_cls(extra_config).supports_checkpoint()
+
+    def checkpoint_prepare(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.checkpoint_prepare()
+
+    def checkpoint_restore(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.checkpoint_restore()
+
     def shutdown(self) -> None:
         if self.connector_worker is not None:
             self.connector_worker.shutdown()

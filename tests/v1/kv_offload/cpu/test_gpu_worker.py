@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import logging
+import os
 import random
 import time
 import uuid
@@ -641,6 +642,102 @@ def test_transfer(
     del src_view, dst_view, orig_dst_view, expected
 
     worker.shutdown()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_checkpoint_prepare_frees_region_and_restore_serves_transfers(
+    default_vllm_config, device: str
+) -> None:
+    """Preparing unregisters the region, waits for the other ranks, then frees
+    its pages. Restoring brings back zeroed, registered memory at the same
+    addresses, and transfers work again. Repeating either is a no-op."""
+    num_gpu_blocks, num_cpu_chunks, page_size_bytes, num_tensors = 16, 8, 1024, 2
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(
+                tensor=torch.zeros(
+                    (num_gpu_blocks, page_size_bytes), dtype=torch.int8, device=device
+                ),
+                page_size_bytes=page_size_bytes,
+            )
+            for _ in range(num_tensors)
+        ],
+        group_data_refs=[
+            [
+                CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=page_size_bytes)
+                for i in range(num_tensors)
+            ]
+        ],
+    )
+    cpu_page_size = round_up(
+        page_size_bytes * num_tensors, SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    )
+    region = SharedOffloadRegion(
+        engine_id=str(uuid.uuid4()),
+        num_chunks=num_cpu_chunks,
+        rank=0,
+        kv_bytes_per_chunk=cpu_page_size,
+        cpu_page_size=cpu_page_size,
+    )
+    region_fd = region.fd
+    assert region_fd is not None
+    at_barrier: list[tuple[bool, int]] = []
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches,
+        blocks_per_chunk=1,
+        num_cpu_chunks=num_cpu_chunks,
+        mmap_region=region,
+        barrier=lambda: at_barrier.append(
+            (region.is_pinned, os.fstat(region_fd).st_blocks * 512)
+        ),
+    )
+    cpu_tensors = worker._store_handler.cpu_tensors
+    try:
+        was_pinned = region.is_pinned
+        addresses = [t.data_ptr() for t in cpu_tensors]
+        for i in range(num_tensors):
+            cpu_tensors[i].fill_(7)
+        assert os.fstat(region_fd).st_blocks * 512 == region.total_size_bytes
+
+        worker.checkpoint_prepare()
+        worker.checkpoint_prepare()
+        assert at_barrier == [(False, region.total_size_bytes)]
+        assert not region.is_pinned
+        assert os.fstat(region_fd).st_blocks == 0
+
+        worker.checkpoint_restore()
+        worker.checkpoint_restore()
+        assert region.is_pinned == was_pinned
+        assert os.fstat(region_fd).st_blocks * 512 == region.total_size_bytes
+        assert [t.data_ptr() for t in cpu_tensors] == addresses
+        assert not any(bool(t.any()) for t in cpu_tensors)
+
+        gpu_blocks, cpu_chunks = [3, 9, 12], [5, 0, 6]
+        for i in range(num_tensors):
+            kv_caches.tensors[i].tensor.random_()
+        gpu_spec = GPULoadStoreSpec(
+            gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(0,)
+        )
+        assert worker.submit_store(
+            1,
+            resolve_device_pointers(gpu_spec, kv_caches),
+            CPULoadStoreSpec(cpu_chunks),
+        )
+        finished: list[TransferResult] = []
+        deadline = time.time() + 10
+        while not finished and time.time() < deadline:
+            finished = worker.get_finished()
+            time.sleep(0.01)
+        assert [(r.job_id, r.success) for r in finished] == [(1, True)]
+        for i in range(num_tensors):
+            torch.testing.assert_close(
+                cpu_tensors[i][cpu_chunks],
+                kv_caches.tensors[i].tensor[gpu_blocks].cpu(),
+            )
+    finally:
+        del cpu_tensors
+        worker.shutdown()
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])

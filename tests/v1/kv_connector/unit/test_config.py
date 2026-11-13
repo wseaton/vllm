@@ -191,6 +191,8 @@ def test_sleep_mode_refuses_unsupported_kv_connector(
 
 _NIXL = {"kv_connector": "NixlConnector", "kv_role": "kv_both"}
 _OFFLOAD = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
+_TIERING = {"spec_name": "TieringOffloadingSpec"}
+_OFFLOAD_TIERING = {**_OFFLOAD, "kv_connector_extra_config": _TIERING}
 
 
 @pytest.mark.parametrize(
@@ -201,7 +203,10 @@ _OFFLOAD = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
         ("NixlConnector", None, False, False),
         ("MooncakeConnector", None, True, False),
         ("MultiConnector", {"connectors": [_NIXL]}, True, True),
-        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD]}, True, False),
+        ("OffloadingConnector", None, False, True),
+        ("OffloadingConnector", _TIERING, False, False),
+        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD]}, True, True),
+        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD_TIERING]}, True, False),
     ],
 )
 def test_kv_connectors_opt_in_to_process_checkpoints(
