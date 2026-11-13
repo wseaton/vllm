@@ -207,6 +207,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
+                barrier=_all_workers_barrier,
             )
         except Exception:
             if mmap_region is not None:

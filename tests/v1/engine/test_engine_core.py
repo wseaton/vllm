@@ -949,6 +949,9 @@ def test_checkpoint_prepare_then_restore_run_in_order():
         "checkpoint_prepare",
         "synchronize_device",
     ]
+    core.model_executor.collective_rpc.assert_any_call(
+        "checkpoint_prepare", None, (), {"release_kv_connector": True}
+    )
 
     core.model_executor.reset_mock()
     core.checkpoint_restore()

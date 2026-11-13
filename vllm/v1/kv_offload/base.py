@@ -762,6 +762,16 @@ class OffloadingWorker(ABC):
     @abstractmethod
     def wait(self, job_ids: set[int]) -> None: ...
 
+    def checkpoint_release(self) -> None:
+        """Free host memory a process checkpoint should not contain. The
+        offloaded data is already dropped and transfers are drained. Every
+        worker rank calls this together. Idempotent."""
+        return
+
+    def checkpoint_restore(self) -> None:
+        """Bring back what `checkpoint_release` freed. Idempotent."""
+        return
+
     def shutdown(self) -> None:
         return
 

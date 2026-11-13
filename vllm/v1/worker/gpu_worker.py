@@ -387,11 +387,22 @@ class Worker(WorkerBase):
             extensible_kv_cache.release_physical()
         self.sleep_mode_backend.discard(tags)
 
-    def checkpoint_prepare(self) -> None:
+    def checkpoint_prepare(self, release_kv_connector: bool = False) -> None:
+        """Release what a process checkpoint must not contain.
+
+        Args:
+            release_kv_connector: Also free the KV connector's host memory.
+                Its cache must already be reset.
+
+        """
+        if release_kv_connector and has_kv_transfer_group():
+            get_kv_transfer_group().checkpoint_release_host_memory()
         checkpoint_prepare_distributed_state()
 
     def checkpoint_restore(self) -> None:
         checkpoint_restore_distributed_state()
+        if has_kv_transfer_group():
+            get_kv_transfer_group().checkpoint_restore_host_memory()
 
     def _weight_checksum_prefix(self) -> str:
         # data_parallel_rank is 0 in dense workers; only the index is unique.

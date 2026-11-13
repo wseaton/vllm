@@ -1007,7 +1007,9 @@ class EngineCore:
                 self._set_kv_cache_reclaimable(True)
             if preparing:
                 self.release_kv_cache_memory()
-                self.collective_rpc("checkpoint_prepare")
+                self.collective_rpc(
+                    "checkpoint_prepare", kwargs={"release_kv_connector": True}
+                )
                 self.collective_rpc("synchronize_device")
                 self._checkpoint_state = CheckpointState.PREPARED
         except Exception as e:

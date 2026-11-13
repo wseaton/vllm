@@ -102,6 +102,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                 spec, vllm_config, kv_cache_config
             )
 
+    def checkpoint_release_host_memory(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.checkpoint_release()
+
+    def checkpoint_restore_host_memory(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.checkpoint_restore()
+
     def shutdown(self) -> None:
         if self.connector_worker is not None:
             self.connector_worker.shutdown()
