@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status};
 use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
-use vllm_engine_core_client::protocol::utility::{PauseMode as EnginePauseMode, SleepLevel};
+use vllm_engine_core_client::protocol::utility::{
+    CheckpointState, PauseMode as EnginePauseMode, SleepLevel,
+};
 
 use super::{ControlServer, pb};
 use crate::config::LoraModulePath;
@@ -101,6 +103,13 @@ impl ControlServiceImpl {
         })
     }
 
+    async fn checkpoint_state(&self) -> Result<(CheckpointState, Option<String>), Status> {
+        self.client()
+            .checkpoint_state()
+            .await
+            .map_err(|error| utility_status("checkpoint_state", error))
+    }
+
     fn require_sleep_mode(&self) -> Result<(), Status> {
         self.sleep_mode_enabled().then_some(()).ok_or_else(|| {
             Status::failed_precondition(
@@ -123,6 +132,37 @@ fn pause_mode(mode: i32) -> Result<EnginePauseMode, Status> {
         Ok(pb::PauseMode::Keep) => Ok(EnginePauseMode::Keep),
         Err(_) => Err(Status::invalid_argument("invalid pause mode")),
     }
+}
+
+fn checkpoint_prepare_mode(mode: i32) -> Result<EnginePauseMode, Status> {
+    match pb::PauseMode::try_from(mode) {
+        Ok(pb::PauseMode::Unspecified) => Ok(EnginePauseMode::Wait),
+        _ => pause_mode(mode),
+    }
+}
+
+fn checkpoint_state_response(
+    state: CheckpointState,
+    error: Option<String>,
+) -> Response<pb::CheckpointStateResponse> {
+    let state = match state {
+        CheckpointState::Running => pb::CheckpointState::Running,
+        CheckpointState::Preparing => pb::CheckpointState::Preparing,
+        CheckpointState::Prepared => pb::CheckpointState::Prepared,
+        CheckpointState::Restoring => pb::CheckpointState::Restoring,
+        CheckpointState::Failed => pb::CheckpointState::Failed,
+    };
+    Response::new(pb::CheckpointStateResponse {
+        state: state.into(),
+        error,
+    })
+}
+
+fn checkpoint_precondition(state: CheckpointState, error: Option<String>) -> Status {
+    Status::failed_precondition(match error {
+        Some(error) => format!("the engines are {state}: {error}"),
+        None => format!("the engines are {state}"),
+    })
 }
 
 fn json_object(bytes: &[u8], field: &'static str) -> Result<JsonValue, Status> {
@@ -415,6 +455,66 @@ impl pb::control_server::Control for ControlServiceImpl {
             .await
             .map_err(|error| utility_status("is_sleeping", error))?;
         Ok(Response::new(pb::IsSleepingResponse { sleeping }))
+    }
+
+    async fn checkpoint_prepare(
+        &self,
+        request: Request<pb::CheckpointPrepareRequest>,
+    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
+        self.require_sleep_mode()?;
+        let mode = checkpoint_prepare_mode(request.into_inner().mode)?;
+        let _guard = self.rl_lock.lock().await;
+        let (mut state, mut error) = self.checkpoint_state().await?;
+        match state {
+            CheckpointState::Running => {
+                if let Some(refusal) = self
+                    .client()
+                    .checkpoint_prepare(mode)
+                    .await
+                    .map_err(|error| utility_status("checkpoint_prepare", error))?
+                {
+                    return Err(Status::failed_precondition(refusal));
+                }
+                (state, error) = self.checkpoint_state().await?;
+            }
+            CheckpointState::Restoring | CheckpointState::Failed => {
+                return Err(checkpoint_precondition(state, error));
+            }
+            CheckpointState::Preparing | CheckpointState::Prepared => {}
+        }
+        Ok(checkpoint_state_response(state, error))
+    }
+
+    async fn checkpoint_restore(
+        &self,
+        _request: Request<pb::CheckpointRestoreRequest>,
+    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
+        self.require_sleep_mode()?;
+        let _guard = self.rl_lock.lock().await;
+        let (mut state, mut error) = self.checkpoint_state().await?;
+        match state {
+            CheckpointState::Preparing | CheckpointState::Failed => {
+                return Err(checkpoint_precondition(state, error));
+            }
+            CheckpointState::Prepared => {
+                self.client()
+                    .checkpoint_restore()
+                    .await
+                    .map_err(|error| utility_status("checkpoint_restore", error))?;
+                (state, error) = self.checkpoint_state().await?;
+            }
+            CheckpointState::Running | CheckpointState::Restoring => {}
+        }
+        Ok(checkpoint_state_response(state, error))
+    }
+
+    async fn get_checkpoint_state(
+        &self,
+        _request: Request<pb::GetCheckpointStateRequest>,
+    ) -> Result<Response<pb::CheckpointStateResponse>, Status> {
+        self.require_sleep_mode()?;
+        let (state, error) = self.checkpoint_state().await?;
+        Ok(checkpoint_state_response(state, error))
     }
 
     async fn init_weight_transfer_engine(
