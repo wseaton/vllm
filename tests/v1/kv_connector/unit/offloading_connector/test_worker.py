@@ -104,6 +104,7 @@ def _make_worker(
     replicated_layout: bool = False,
     rank: int = 0,
     canonical_layout: bool = False,
+    async_init: bool = False,
 ):
     """Create an OffloadingConnectorWorker with mocked dependencies."""
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
@@ -112,7 +113,7 @@ def _make_worker(
 
     spec = MagicMock(spec=OffloadingSpec)
     spec.replicated_layout = replicated_layout
-    spec.async_init = False
+    spec.async_init = async_init
     spec.config = MagicMock()
     spec.config.canonical_layout = canonical_layout
     spec.config.parallel.rank = rank
@@ -204,6 +205,34 @@ class BareExternalOffloadingSpec(OffloadingSpec):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("async_init", [False, True])
+def test_checkpoint_restore_reports_ready_again_under_async_init(async_init):
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]),
+        rank=1,
+        async_init=async_init,
+    )
+    assert worker.worker is not None
+    worker.worker.is_ready.return_value = True
+
+    def reported_ready() -> bool:
+        meta = worker.build_connector_worker_meta()
+        return meta is not None and meta.ready_ranks == {1}
+
+    assert reported_ready() == async_init
+    assert not reported_ready()
+
+    worker.checkpoint_prepare()
+    worker.checkpoint_restore()
+    worker.worker.checkpoint_prepare.assert_called_once()
+    worker.worker.checkpoint_restore.assert_called_once()
+    worker.worker.is_ready.return_value = False
+    assert not reported_ready()
+    worker.worker.is_ready.return_value = True
+    assert reported_ready() == async_init
+    assert not reported_ready()
 
 
 def test_prepare_store_kv_non_writer_marks_completed_without_submit():

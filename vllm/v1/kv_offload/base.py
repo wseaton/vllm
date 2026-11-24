@@ -780,6 +780,16 @@ class OffloadingWorker(ABC):
         """Whether this worker can take transfers."""
         return True
 
+    def checkpoint_prepare(self) -> None:
+        """Free host memory a process checkpoint should not contain. The
+        offloaded data is already dropped and transfers are drained. Every
+        worker rank calls this together. Idempotent."""
+        return
+
+    def checkpoint_restore(self) -> None:
+        """Bring back what `checkpoint_prepare` freed. Idempotent."""
+        return
+
     def shutdown(self) -> None:
         return
 
@@ -805,6 +815,12 @@ class OffloadingSpec(ABC):
 
         """
         return ()
+
+    @classmethod
+    def supports_checkpoint(cls, extra_config: dict[str, Any]) -> bool:
+        """Whether a process checkpoint of an engine using this spec, with
+        this kv_connector_extra_config, can be restored."""
+        return False
 
     def __init__(self, config: OffloadingConfig):
         self.config = config

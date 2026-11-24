@@ -828,15 +828,20 @@ class CPUOffloadingWorker(OffloadingWorker):
         defer_host_setup: bool = False,
         prefault_shard: tuple[int, int] | None = None,
         pin_pace: float = 2.0,
+        barrier: Callable[[], None] | None = None,
     ):
         """defer_host_setup leaves pre-faulting and pinning mmap_region to
         start_deferred_setup(); prefault_shard is then the share this worker
-        pre-faults first, and pin_pace paces its pinning (see pin_mmap_region)."""
+        pre-faults first, and pin_pace paces its pinning (see pin_mmap_region).
+        barrier waits for every worker that maps a shared mmap_region."""
         assert not canonical_layout or mmap_region is not None
+        self._barrier = barrier
         # The caller owns mmap_region until this constructor returns. After a
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
         self._mmap_region = mmap_region
+        self._checkpoint_released = False
+        self._checkpoint_repin = False
         pin_memory = PIN_MEMORY
         self._pin_memory = pin_memory
         self._worker_slot_only = not canonical_layout
@@ -986,11 +991,55 @@ class CPUOffloadingWorker(OffloadingWorker):
         self._load_handler.wait(job_ids)
         self._expedited_load_handler.wait(job_ids)
 
+    def checkpoint_prepare(self) -> None:
+        region = self._mmap_region
+        if region is None or self._checkpoint_released:
+            return
+        self._stop_host_setup()
+        self._ready.clear()
+        self._checkpoint_repin = region.is_pinned
+        region.unpin()
+        if self._barrier is not None:
+            self._barrier()
+        region.release_pages()
+        self._checkpoint_released = True
+
+    def checkpoint_restore(self) -> None:
+        region = self._mmap_region
+        if region is None or not self._checkpoint_released:
+            return
+        self._checkpoint_released = False
+        if self._defer_host_setup:
+            self.start_deferred_setup()
+            return
+        start = time.monotonic()
+        for offset, length in region.prefault_ranges(self._prefault_shard):
+            region.prefault(offset, length)
+        if self._checkpoint_repin:
+            pin_mmap_region(region, worker_slot_only=self._worker_slot_only)
+            if not region.is_pinned:
+                raise RuntimeError(
+                    "Failed to register the CPU offload region again after a "
+                    "process checkpoint"
+                )
+        self._ready.set()
+        logger.info(
+            "Restored the %.2f GB CPU offload region in %.2f s",
+            region.total_size_bytes / 1e9,
+            time.monotonic() - start,
+        )
+
+    def _stop_host_setup(self) -> None:
+        if self._setup_thread is None:
+            return
+        self._setup_stop.set()
+        self._setup_thread.join()
+        self._setup_thread = None
+        self._setup_stop.clear()
+
     def shutdown(self) -> None:
         # The region must outlive the setup thread that touches it.
-        if self._setup_thread is not None:
-            self._setup_stop.set()
-            self._setup_thread.join()
+        self._stop_host_setup()
         handler_failed = False
         try:
             self._store_handler.shutdown()

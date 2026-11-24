@@ -2883,6 +2883,39 @@ def test_async_init_waits_for_every_worker(request_runner):
         assert scheduler._offloading_enabled == enabled
 
 
+@pytest.mark.parametrize("async_init", [False, True])
+def test_checkpoint_prepare_waits_for_every_worker_again(request_runner, async_init):
+    """Under async_init a restore sets host memory up again in the background, so
+    offloading waits for every worker to report ready again. Without it the
+    restore is synchronous and offloading stays on."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        worker_count=2,
+        extra_config_overrides={"async_init": async_init},
+    )
+    scheduler = runner.connector_scheduler
+
+    def report(rank: int) -> None:
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(ready_ranks={rank})
+            )
+        )
+
+    for rank in (0, 1):
+        report(rank)
+    assert scheduler._offloading_enabled
+
+    scheduler.checkpoint_prepare()
+    assert scheduler._offloading_enabled == (not async_init)
+    report(0)
+    assert scheduler._offloading_enabled == (not async_init)
+    report(1)
+    assert scheduler._offloading_enabled
+
+
 def test_scheduler_reports_lookup_sync_delay(request_runner):
     runner = request_runner(
         block_size=4,

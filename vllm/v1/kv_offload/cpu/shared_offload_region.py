@@ -26,6 +26,7 @@ from vllm.v1.kv_offload.cpu.host_register import host_unregister
 logger = init_logger(__name__)
 
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
+_MADV_REMOVE = getattr(mmap, "MADV_REMOVE", 9)
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 _MAP_FIXED = 0x10
 # Page-cache inserts are serialized per shm file, capping pre-faulting of one
@@ -513,14 +514,24 @@ class SharedOffloadRegion:
         )
         return memoryview(np_arr)
 
+    def unpin(self) -> None:
+        """Drop this worker's host registrations."""
+        if not self.is_pinned or self._base is None:
+            return
+        addresses = self.pinned_addresses or [self._base.data_ptr()]
+        for address in reversed(addresses):
+            host_unregister(address)
+        self.pinned_addresses.clear()
+        self.is_pinned = False
+
+    def release_pages(self) -> None:
+        """Free the region's memory and keep its mappings. The contents are
+        lost, and every worker that maps it must have unpinned first."""
+        assert self.mmap_obj is not None
+        self.mmap_obj.madvise(_MADV_REMOVE, 0, self.total_size_bytes)
+
     def cleanup(self) -> None:
-        if self.is_pinned and self._base is not None:
-            base_ptr = self._base.data_ptr()
-            addresses = self.pinned_addresses or [base_ptr]
-            for address in reversed(addresses):
-                host_unregister(address)
-            self.pinned_addresses.clear()
-            self.is_pinned = False
+        self.unpin()
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
         # drop so the storage (which holds the mmap_obj buffer export) is freed

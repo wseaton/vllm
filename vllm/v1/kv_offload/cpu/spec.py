@@ -215,6 +215,11 @@ class CPUOffloadingSpec(OffloadingSpec):
             current_platform.is_cuda_alike() and not current_platform.is_rocm()
         ) or current_platform.is_xpu()
 
+    @classmethod
+    @override
+    def supports_checkpoint(cls, extra_config: dict[str, Any]) -> bool:
+        return True
+
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None
         prefault_shard: tuple[int, int] | None = None
@@ -266,6 +271,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 defer_host_setup=self.async_init,
                 prefault_shard=prefault_shard,
                 pin_pace=self.async_init_pin_pace,
+                barrier=_all_workers_barrier if self.replicated_layout else None,
             )
         except Exception:
             if mmap_region is not None:

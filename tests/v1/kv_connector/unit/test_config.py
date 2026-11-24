@@ -191,6 +191,7 @@ def test_sleep_mode_refuses_unsupported_kv_connector(
 
 _NIXL = {"kv_connector": "NixlConnector", "kv_role": "kv_both"}
 _OFFLOAD = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
+_MOONCAKE = {"kv_connector": "MooncakeConnector", "kv_role": "kv_both"}
 
 
 @pytest.mark.parametrize(
@@ -201,7 +202,8 @@ _OFFLOAD = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}
         ("NixlConnector", None, False, False),
         ("MooncakeConnector", None, True, False),
         ("MultiConnector", {"connectors": [_NIXL]}, True, True),
-        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD]}, True, False),
+        ("MultiConnector", {"connectors": [_NIXL, _OFFLOAD]}, True, True),
+        ("MultiConnector", {"connectors": [_NIXL, _MOONCAKE]}, True, False),
     ],
 )
 def test_kv_connectors_opt_in_to_process_checkpoints(
@@ -214,6 +216,33 @@ def test_kv_connectors_opt_in_to_process_checkpoints(
         kv_connector_extra_config=extra_config,
         enable_sleep_mode=True,
         checkpoint_prepare_on_startup=prepare_on_startup,
+    )
+    connector_cls = KVConnectorFactory.get_connector_class(config.kv_transfer_config)
+    assert connector_cls.supports_checkpoint(config) == supported
+
+
+@pytest.mark.parametrize(
+    "extra_config,supported",
+    [
+        (None, True),
+        ({"spec_name": "TieringOffloadingSpec"}, True),
+        (
+            {
+                "spec_name": "TieringOffloadingSpec",
+                "secondary_tiers": [{"type": "fs", "root_dir": "/tmp/kv"}],
+            },
+            False,
+        ),
+    ],
+)
+def test_offloading_connector_opts_in_to_process_checkpoints(extra_config, supported):
+    """The CPU tier is released for a process checkpoint, alone or as the tiering
+    spec's primary tier. Secondary tiers keep transfers and connections a
+    checkpoint cannot carry."""
+    config = _build_config(
+        kv_connector="OffloadingConnector",
+        kv_connector_extra_config=extra_config,
+        enable_sleep_mode=True,
     )
     connector_cls = KVConnectorFactory.get_connector_class(config.kv_transfer_config)
     assert connector_cls.supports_checkpoint(config) == supported

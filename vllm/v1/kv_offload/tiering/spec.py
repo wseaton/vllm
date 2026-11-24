@@ -71,7 +71,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import (
     REGION_SEGMENTS,
     SharedOffloadRegion,
 )
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, _all_workers_barrier
 from vllm.v1.kv_offload.tiering.base import (
     TIER_LABEL,
     SecondaryTierManager,
@@ -332,6 +332,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
         return metrics
 
+    @classmethod
+    @override
+    def supports_checkpoint(cls, extra_config: dict[str, Any]) -> bool:
+        return not extra_config.get("secondary_tiers")
+
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
@@ -591,6 +596,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
+                prefault_shard=(
+                    (worker_index, world_size) if self.replicated_layout else None
+                ),
+                barrier=_all_workers_barrier,
             )
         except Exception:
             worker_mmap.cleanup()

@@ -253,7 +253,8 @@ class OffloadingConnectorScheduler:
         self.manager: OffloadingManager = spec.get_manager()
         # Under async_init the engine serves without offloading until every
         # worker has reported ready.
-        self._offloading_enabled = not spec.async_init
+        self._async_init = spec.async_init
+        self._offloading_enabled = not self._async_init
         self._ready_ranks: set[int] = set()
         if not self._offloading_enabled:
             logger.info("KV offloading is off until every worker is ready")
@@ -1696,6 +1697,15 @@ class OffloadingConnectorScheduler:
         # Still a generator, so callers testing the result for truthiness keep
         # seeing a non-empty object the way they do today.
         yield from self._events_tracker.take_events(manager_events)
+
+    def checkpoint_prepare(self) -> None:
+        """Under async_init, a restore sets the workers' host memory up again in
+        the background, so offloading waits for every worker to be ready again."""
+        if not self._async_init:
+            return
+        with self._manager_locked():
+            self._offloading_enabled = False
+            self._ready_ranks.clear()
 
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored chunks."""
