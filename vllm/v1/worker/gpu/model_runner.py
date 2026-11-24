@@ -120,6 +120,7 @@ from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
+    CudaGraphManager,
     ModelCudaGraphManager,
     has_compiled_submodule,
     make_cudagraph_stats,
@@ -1167,6 +1168,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cudagraph_manager is not None
             and self.cudagraph_manager.needs_capture()
         )
+
+    def release_cuda_graphs(self) -> None:
+        """Drop every captured CUDA graph so `capture_model` can capture them
+        again, for example after the communicators they replay are replaced."""
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.release_graphs()
+        if self.model_state.supports_mm_inputs:
+            self.model_state.encoder_runner.clear()
+        for attr in vars(self.speculator).values() if self.speculator else ():
+            if isinstance(attr, CudaGraphManager):
+                attr.release_graphs()
+        CUDAGraphWrapper.clear_all_graphs()
+        BreakableCUDAGraphWrapper.clear_all_graphs()
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        self.switch_to_fresh_graph_pool()
+
+    def switch_to_fresh_graph_pool(self) -> None:
+        """Point every graph manager and wrapper at a new global graph pool."""
+        # Libraries may keep capture-time tensors alive after their graphs are
+        # released (e.g. FlyDSL retains the last launch's DLPack arguments), so
+        # the old pool cannot be erased. Re-capturing into that pool trips the
+        # allocator's "use_count > 0" assert; capture into a fresh one instead.
+        platform_cls = type(current_platform)
+        if platform_cls._global_graph_pool is None:
+            return
+        new_pool = current_platform.graph_pool_handle()
+        platform_cls._global_graph_pool = new_pool
+
+        managers = [self.cudagraph_manager] + [
+            attr
+            for attr in (vars(self.speculator).values() if self.speculator else ())
+            if isinstance(attr, CudaGraphManager)
+        ]
+        for manager in managers:
+            if manager is not None and manager.pool is not None:
+                manager.pool = new_pool
+
+        wrappers: list[CUDAGraphWrapper | BreakableCUDAGraphWrapper] = [
+            *CUDAGraphWrapper._all_instances,
+            *BreakableCUDAGraphWrapper._all_instances,
+        ]
+        for wrapper in wrappers:
+            wrapper.graph_pool = new_pool
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:

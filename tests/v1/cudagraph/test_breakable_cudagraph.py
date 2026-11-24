@@ -393,6 +393,38 @@ def test_shutdown_allows_recapture_with_live_outputs(cuda_capture_stream):
     assert torch.equal(new_output, torch.full_like(x, 5))
 
 
+def test_released_graphs_recapture_into_a_fresh_pool(cuda_capture_stream):
+    """A pinned host block captured into the pool outlives its graphs; the
+    recapture after `release_cuda_graphs` must not reuse that pool."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    current_platform.reset_global_graph_pool()
+    x = torch.ones(4, device=DEVICE_TYPE)
+    old_pool = current_platform.get_global_graph_pool()
+    first = BreakableCUDAGraphCapture(pool=old_pool)
+    with first:
+        held = torch.empty(4, pin_memory=True)
+        x + 1
+    del first
+    torch.accelerator.synchronize()
+    torch._C._host_emptyCache()
+
+    runner = SimpleNamespace(cudagraph_manager=None, speculator=None)
+    GPUModelRunner.switch_to_fresh_graph_pool(runner)
+    new_pool = current_platform.get_global_graph_pool()
+    assert new_pool != old_pool
+
+    second = BreakableCUDAGraphCapture(pool=new_pool)
+    with second:
+        out = x + 2
+    x.fill_(3)
+    second.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(out, torch.full_like(x, 5))
+    assert held.is_pinned()
+
+
 def test_add_eager_creates_alternating_graph_eager_graph(cuda_capture_stream):
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 

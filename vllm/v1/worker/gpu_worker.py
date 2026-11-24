@@ -142,7 +142,7 @@ from vllm.v1.worker.startup_plan import (
     maybe_save_startup_plan,
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import init_workspace_manager, unlock_workspace
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
@@ -251,6 +251,8 @@ class Worker(WorkerBase):
     ):
         if not HAS_TRITON and not current_platform.uses_standalone_cpu_model_runner():
             raise ValueError("vLLM's model runner requires Triton.")
+        self._checkpoint_graphs_released = False
+        self._sleeping_tags: set[str] = set()
 
         super().__init__(
             vllm_config=vllm_config,
@@ -383,6 +385,7 @@ class Worker(WorkerBase):
         if extensible_kv_cache is not None:
             extensible_kv_cache.release_physical()
         self.sleep_mode_backend.suspend(discardable)
+        self._sleeping_tags = {"weights", "kv_cache"}
         if self.vllm_config.model_config.enable_nccl_comm_suspend:
             suspend_device_comms()
 
@@ -405,6 +408,7 @@ class Worker(WorkerBase):
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.sleep_mode_backend.resume(tags)
+        self._sleeping_tags = set() if tags is None else self._sleeping_tags - set(tags)
         wake_kv_cache = tags is None or "kv_cache" in tags
         # Back the extensible KV cache before the connector re-registers it.
         extensible_kv_cache = getattr(self.model_runner, "extensible_kv_cache", None)
@@ -420,7 +424,11 @@ class Worker(WorkerBase):
         if loader := _bound_model_loader(self.model_runner):
             loader.on_wake_up(tags)
 
+        if self._checkpoint_graphs_released and not self._sleeping_tags:
+            self._capture_released_graphs()
+
     def discard(self, tags: tuple[str, ...]) -> None:
+        self._sleeping_tags.update(tags)
         if "weights" in tags:
             if loader := _bound_model_loader(self.model_runner):
                 loader.on_sleep(2)
@@ -440,6 +448,9 @@ class Worker(WorkerBase):
         self.sleep_mode_backend.discard(tags)
 
     def checkpoint_prepare(self) -> None:
+        if self._checkpoint_graphs_captured():
+            self.model_runner.release_cuda_graphs()
+            self._checkpoint_graphs_released = True
         # Connectors are created after the communicators, so release them first.
         if has_kv_transfer_group():
             get_kv_transfer_group().checkpoint_prepare()
@@ -452,6 +463,22 @@ class Worker(WorkerBase):
         checkpoint_restore_distributed_state()
         if has_kv_transfer_group():
             get_kv_transfer_group().checkpoint_restore()
+
+    def _capture_released_graphs(self) -> None:
+        """Capture the graphs `checkpoint_prepare` released."""
+        unlock_workspace()
+        with (
+            self.model_runner.eplb.suppress(),
+            self._get_cudagraph_capture_context(),
+        ):
+            self.model_runner.capture_model()
+        self._checkpoint_graphs_released = False
+
+    def _checkpoint_graphs_captured(self) -> bool:
+        return not (
+            self.model_config.enforce_eager
+            or self.parallel_config.world_size_across_dp == 1
+        )
 
     def _weight_checksum_prefix(self) -> str:
         # data_parallel_rank is 0 in dense workers; only the index is unique.

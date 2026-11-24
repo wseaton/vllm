@@ -82,6 +82,30 @@ def test_pynccl():
 
 
 @worker_fn_wrapper
+def checkpoint_recreate_worker_fn():
+    pynccl_comm = PyNcclCommunicator(
+        get_world_group().cpu_group, device=get_world_group().device
+    )
+    pynccl_comm.checkpoint_release()
+    pynccl_comm.checkpoint_release()
+    pynccl_comm.checkpoint_recreate()
+    pynccl_comm.checkpoint_recreate()
+    tensor = torch.ones(16, 1024, 1024, dtype=torch.float32).cuda(pynccl_comm.rank)
+    tensor = pynccl_comm.all_reduce(tensor)
+    torch.accelerator.synchronize()
+    assert torch.all(tensor == pynccl_comm.world_size).cpu().item()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+)
+def test_pynccl_checkpoint_recreate():
+    """A communicator released for a process checkpoint is replaced by a new
+    one that reduces correctly, and repeating either step is a no-op."""
+    distributed_run(checkpoint_recreate_worker_fn, 2)
+
+
+@worker_fn_wrapper
 def multiple_allreduce_worker_fn():
     device = torch.device(f"cuda:{torch.distributed.get_rank()}")
     if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:

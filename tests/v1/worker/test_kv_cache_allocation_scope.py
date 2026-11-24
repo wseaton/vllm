@@ -118,6 +118,8 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
             sleep_mode_backend=SimpleNamespace(resume=lambda tags: None),
             model_runner=runner,
             synchronize_device=lambda: None,
+            _sleeping_tags={"weights", "kv_cache"},
+            _checkpoint_graphs_released=False,
             vllm_config=SimpleNamespace(
                 model_config=SimpleNamespace(enable_nccl_comm_suspend=False)
             ),
@@ -136,3 +138,41 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
         for actual, expected in zip(runner.layout_tensors, layout_tensors, strict=True)
     )
     assert tuple(t.data_ptr() for t in runner.layout_tensors) == layout_ptrs
+
+
+@pytest.mark.parametrize(
+    "wakes",
+    [
+        [["kv_cache"], ["weights"]],
+        [["weights"], ["kv_cache"]],
+        [None],
+    ],
+)
+def test_released_graphs_are_captured_once_everything_is_awake(
+    wakes: list[list[str] | None],
+) -> None:
+    captures: list[set[str]] = []
+    worker = SimpleNamespace(
+        sleep_mode_backend=SimpleNamespace(resume=lambda tags: None),
+        model_runner=SimpleNamespace(),
+        synchronize_device=lambda: None,
+        _sleeping_tags={"weights", "kv_cache"},
+        _checkpoint_graphs_released=True,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(enable_nccl_comm_suspend=False)
+        ),
+    )
+
+    def capture() -> None:
+        captures.append(set(worker._sleeping_tags))
+        worker._checkpoint_graphs_released = False
+
+    worker._capture_released_graphs = capture
+
+    for tags in wakes[:-1]:
+        Worker.wake_up(cast(Worker, worker), tags=tags)
+        assert captures == []
+    Worker.wake_up(cast(Worker, worker), tags=wakes[-1])
+    assert captures == [set()]
+    Worker.wake_up(cast(Worker, worker), tags=None)
+    assert len(captures) == 1
