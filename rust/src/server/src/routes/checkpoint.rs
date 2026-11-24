@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::utility::{CheckpointState, PauseMode};
 
+use crate::checkpoint::{self, Transition};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::utils::utility_call_error;
@@ -41,12 +42,24 @@ fn state_response(
     Ok((status, Json(CheckpointStateResponse { state, error })))
 }
 
-async fn current_state(state: &AppState) -> Result<(CheckpointState, Option<String>), ApiError> {
-    state
-        .engine_core_client()
-        .checkpoint_state()
-        .await
-        .map_err(|error| utility_call_error("checkpoint_state", error))
+fn call_error(call: checkpoint::CallError) -> ApiError {
+    utility_call_error(call.method, call.error)
+}
+
+fn transition_response(transition: Transition) -> CheckpointResult {
+    match transition {
+        Transition::Accepted(checkpoint_state, error) => {
+            state_response(StatusCode::OK, checkpoint_state, error)
+        }
+        Transition::Refused(refusal) => state_response(
+            StatusCode::BAD_REQUEST,
+            CheckpointState::Running,
+            Some(refusal),
+        ),
+        Transition::Invalid(checkpoint_state, error) => {
+            state_response(StatusCode::BAD_REQUEST, checkpoint_state, error)
+        }
+    }
 }
 
 /// Drain with `mode` and release what a process checkpoint must not contain.
@@ -57,54 +70,26 @@ pub async fn prepare(
     params: Result<Query<PrepareParams>, QueryRejection>,
 ) -> CheckpointResult {
     let Query(params) = params?;
-    let (mut checkpoint_state, mut error) = current_state(&state).await?;
-    match checkpoint_state {
-        CheckpointState::Running => {
-            if let Some(refusal) = state
-                .engine_core_client()
-                .checkpoint_prepare(params.mode)
-                .await
-                .map_err(|error| utility_call_error("checkpoint_prepare", error))?
-            {
-                return state_response(StatusCode::BAD_REQUEST, checkpoint_state, Some(refusal));
-            }
-            (checkpoint_state, error) = current_state(&state).await?;
-        }
-        CheckpointState::Restoring | CheckpointState::Failed => {
-            return state_response(StatusCode::BAD_REQUEST, checkpoint_state, error);
-        }
-        CheckpointState::Preparing | CheckpointState::Prepared => {}
-    }
-    state_response(StatusCode::OK, checkpoint_state, error)
+    transition_response(
+        checkpoint::prepare(state.engine_core_client(), params.mode)
+            .await
+            .map_err(call_error)?,
+    )
 }
 
 /// Bring back what preparing released and serve, in the restored process or
 /// in place. Orchestrators may deliver this more than once, so a restore in
 /// progress or done returns 200.
 pub async fn restore(State(state): State<Arc<AppState>>) -> CheckpointResult {
-    let (mut checkpoint_state, mut error) = current_state(&state).await?;
-    match checkpoint_state {
-        CheckpointState::Preparing | CheckpointState::Failed => {
-            return state_response(StatusCode::BAD_REQUEST, checkpoint_state, error);
-        }
-        CheckpointState::Prepared => {
-            state
-                .engine_core_client()
-                .checkpoint_restore()
-                .await
-                .map_err(|error| utility_call_error("checkpoint_restore", error))?;
-            (checkpoint_state, error) = current_state(&state).await?;
-        }
-        CheckpointState::Running | CheckpointState::Restoring => {}
-    }
-    state_response(StatusCode::OK, checkpoint_state, error)
+    transition_response(checkpoint::restore(state.engine_core_client()).await.map_err(call_error)?)
 }
 
 /// Return 200 once every engine is prepared, 503 until then and 500 if that
 /// cannot happen, so orchestrators can poll it to learn when the process is
 /// safe to capture.
 pub async fn status(State(state): State<Arc<AppState>>) -> CheckpointResult {
-    let (checkpoint_state, error) = current_state(&state).await?;
+    let (checkpoint_state, error) =
+        checkpoint::state(state.engine_core_client()).await.map_err(call_error)?;
     let status = match checkpoint_state {
         CheckpointState::Prepared => StatusCode::OK,
         CheckpointState::Failed => StatusCode::INTERNAL_SERVER_ERROR,
