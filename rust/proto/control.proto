@@ -31,6 +31,20 @@ service Control {
   rpc Sleep (SleepRequest) returns (SleepResponse) {}
   rpc WakeUp (WakeUpRequest) returns (WakeUpResponse) {}
   rpc IsSleeping (IsSleepingRequest) returns (IsSleepingResponse) {}
+
+  // Process checkpoint lifecycle. These return FAILED_PRECONDITION unless the
+  // engines were started with sleep mode.
+  //
+  // Start preparing every engine for a process checkpoint: drain, then
+  // release the KV cache and what a checkpoint must not contain. Returns once
+  // started; poll GetCheckpointState until PREPARED. Repeating is a no-op.
+  // FAILED_PRECONDITION if the engines refuse, are restoring, or have failed.
+  rpc CheckpointPrepare (CheckpointPrepareRequest) returns (CheckpointStateResponse) {}
+  // Bring back what preparing released and serve again, in the restored
+  // process or in place. A restore in progress or done succeeds, so callers
+  // may repeat it. FAILED_PRECONDITION while preparing or after a failure.
+  rpc CheckpointRestore (CheckpointRestoreRequest) returns (CheckpointStateResponse) {}
+  rpc GetCheckpointState (GetCheckpointStateRequest) returns (CheckpointStateResponse) {}
   rpc InitWeightTransferEngine (InitWeightTransferEngineRequest) returns (InitWeightTransferEngineResponse) {}
   rpc StartWeightUpdate (StartWeightUpdateRequest) returns (StartWeightUpdateResponse) {}
   rpc StartDraftWeightUpdate (StartDraftWeightUpdateRequest) returns (StartDraftWeightUpdateResponse) {}
@@ -156,6 +170,32 @@ message WakeUpResponse {}
 
 message IsSleepingRequest {}
 message IsSleepingResponse { bool sleeping = 1; }
+
+enum CheckpointState {
+  CHECKPOINT_STATE_UNSPECIFIED = 0;
+  // Serving requests.
+  CHECKPOINT_STATE_RUNNING = 1;
+  // Draining, then releasing what a checkpoint must not contain.
+  CHECKPOINT_STATE_PREPARING = 2;
+  // Safe to capture.
+  CHECKPOINT_STATE_PREPARED = 3;
+  // Bringing back what preparing released.
+  CHECKPOINT_STATE_RESTORING = 4;
+  // Preparing or restoring failed.
+  CHECKPOINT_STATE_FAILED = 5;
+}
+
+message CheckpointPrepareRequest {
+  // How to drain in-flight requests; PAUSE_MODE_UNSPECIFIED means PAUSE_MODE_WAIT.
+  PauseMode mode = 1;
+}
+message CheckpointRestoreRequest {}
+message GetCheckpointStateRequest {}
+message CheckpointStateResponse {
+  CheckpointState state = 1;
+  // Why the lifecycle failed; set only with CHECKPOINT_STATE_FAILED.
+  optional string error = 2;
+}
 
 // The payloads are backend-specific JSON objects. Tensor data remains on the
 // configured NCCL, IPC, or sparse-NCCL transport rather than crossing gRPC.
