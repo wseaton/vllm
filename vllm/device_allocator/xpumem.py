@@ -175,6 +175,7 @@ class XpuMemAllocator:
         self,
         offload_tags: tuple[str, ...] | str | None = None,
         discardable: Collection[int] = (),
+        tags: tuple[str, ...] | None = None,
     ) -> None:
         if offload_tags is None:
             offload_tags = (XpuMemAllocator.default_tag,)
@@ -189,6 +190,8 @@ class XpuMemAllocator:
         discarded = discardable_allocations(self.allocator_and_pools, discardable)
 
         for ptr, data in self.pointer_to_data.items():
+            if tags is not None and data.tag not in tags:
+                continue
             offload = data.tag in offload_tags and ptr not in discarded
             if data.is_asleep:
                 if offload != (data.cpu_backup_tensor is not None):

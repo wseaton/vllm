@@ -335,20 +335,24 @@ class Worker(WorkerBase):
             )
         return parameters
 
-    def _discardable_parameters(self, model: nn.Module) -> set[int]:
+    def _discardable_parameters(
+        self, model: nn.Module, keep_draft: bool = False
+    ) -> set[int]:
         """Storage of the parameters the weight update rewrites."""
         storage = {
             name: parameter.untyped_storage().data_ptr()
             for name, parameter in self._get_sleep_parameters(model).items()
         }
+        patterns = list(self.model_config.sleep_preserve_parameter_names)
+        if keep_draft:
+            patterns.append("draft.*")
         preserved: set[int] = set()
-        for pattern in self.model_config.sleep_preserve_parameter_names:
+        for pattern in patterns:
             matches = fnmatch_filter(storage, pattern)
             if not matches and pattern != "draft.*":
                 raise ValueError(f"No parameter matches sleep retention: {pattern}")
             preserved.update(storage[name] for name in matches)
         draft_names = fnmatch_filter(storage, "draft.*")
-        patterns = self.model_config.sleep_preserve_parameter_names
         if draft_names and not any(fnmatch_filter(draft_names, p) for p in patterns):
             logger.warning_once(
                 "Level 2 sleep discards draft model weights; reload_weights "
@@ -417,6 +421,16 @@ class Worker(WorkerBase):
             loader.on_wake_up(tags)
 
     def discard(self, tags: tuple[str, ...]) -> None:
+        if "weights" in tags:
+            if loader := _bound_model_loader(self.model_runner):
+                loader.on_sleep(2)
+            self.sleep_mode_backend.suspend(
+                self._discardable_parameters(self.model_runner.model, keep_draft=True),
+                tags=("weights",),
+            )
+            tags = tuple(tag for tag in tags if tag != "weights")
+            if not tags:
+                return
         if has_kv_transfer_group() and "kv_cache" in tags:
             get_kv_transfer_group().unregister_kv_caches()
         # Outside the allocator pool, like in sleep.

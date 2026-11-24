@@ -51,14 +51,19 @@ class SleepModeBackend(ABC):
         self._state: SleepModeState = "RUNNING"
 
     @abstractmethod
-    def suspend(self, discardable: Collection[int] = ()) -> None:
+    def suspend(
+        self,
+        discardable: Collection[int] = (),
+        tags: tuple[str, ...] | None = None,
+    ) -> None:
         """Free GPU state, so that `resume` restores it at the same addresses.
 
         `discardable` holds the storage addresses of the tensors the caller
         rewrites after `resume`, so they need no backup: the parameters not
         selected for preservation at level 2, nothing at level 1. A backend
         doesn't need to know the level. KV cache and workspace scratch are never
-        restored.
+        restored. `tags` limits the suspension to allocations with those tags,
+        leaving the rest in place.
         """
         raise NotImplementedError
 
@@ -134,9 +139,15 @@ class CuMemBackend(SleepModeBackend):
 
         return get_mem_allocator_instance()
 
-    def suspend(self, discardable: Collection[int] = ()) -> None:
+    def suspend(
+        self,
+        discardable: Collection[int] = (),
+        tags: tuple[str, ...] | None = None,
+    ) -> None:
         self._state = "SUSPENDED"
-        self._get_allocator().sleep(("weights", "runtime", "cudagraph"), discardable)
+        self._get_allocator().sleep(
+            ("weights", "runtime", "cudagraph"), discardable, tags=tags
+        )
 
     def resume(self, tags: list[str] | None = None) -> None:
         self._state = "RESUMING"

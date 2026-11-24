@@ -262,6 +262,7 @@ class CuMemAllocator:
         self,
         offload_tags: tuple[str, ...] | str | None = None,
         discardable: Collection[int] = (),
+        tags: tuple[str, ...] | None = None,
     ) -> None:
         """Put the allocator in sleep mode.
         All data in the memory allocation with the specified tag will be
@@ -272,6 +273,8 @@ class CuMemAllocator:
                 offloaded. The rest of the memory allocation will be discarded.
             discardable: Addresses of tensors the caller rewrites after waking.
                 Weights allocations holding nothing else are discarded too.
+            tags: If given, only allocations with these tags are put to sleep;
+                the rest stay mapped.
 
         """
         if offload_tags is None:
@@ -289,6 +292,8 @@ class CuMemAllocator:
         discarded = discardable_allocations(self.allocator_and_pools, discardable)
 
         for ptr, data in self.pointer_to_data.items():
+            if tags is not None and data.tag not in tags:
+                continue
             offload = data.tag in offload_tags and ptr not in discarded
             if data.is_asleep:
                 if offload != (data.cpu_backup_tensor is not None):

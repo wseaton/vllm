@@ -51,6 +51,7 @@ class MemAllocator(Protocol):
         self,
         offload_tags: tuple[str, ...] | str | None = None,
         discardable: Collection[int] = (),
+        tags: tuple[str, ...] | None = None,
     ) -> None: ...
 
     def discard(self, tags: tuple[str, ...] | str) -> None: ...
